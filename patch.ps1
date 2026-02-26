@@ -183,19 +183,9 @@ $RTL_INJECTION_CODE = @'
 
         function injectGlobalRTLStyles() {
             if (document.getElementById('claude-rtl-global-styles')) return;
-            const style = document.createElement('style');
+            var style = document.createElement('style');
             style.id = 'claude-rtl-global-styles';
-            style.textContent = `
-                p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary {
-                    unicode-bidi: plaintext;
-                    direction: auto;
-                }
-                pre, code, .code-block__code, .relative.group\\/copy {
-                    unicode-bidi: embed !important;
-                    direction: ltr !important;
-                    text-align: left !important;
-                }
-            `;
+            style.textContent = 'p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary { unicode-bidi: plaintext; direction: auto; } pre, code, .code-block__code, .relative.group\\/copy { unicode-bidi: embed !important; direction: ltr !important; text-align: left !important; }';
             document.head.appendChild(style);
         }
 
