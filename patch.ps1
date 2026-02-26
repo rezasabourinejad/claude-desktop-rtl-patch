@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Claude Desktop Smart RTL Patcher & Service Fixer
 .DESCRIPTION
