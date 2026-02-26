@@ -15,7 +15,7 @@ Smart RTL (Right-to-Left) support for **Claude Desktop on Windows**. Adds automa
 Open **PowerShell** and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1 | iex
+irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1 | iex
 ```
 
 A UAC prompt will appear — click **Yes** to grant admin privileges.
@@ -24,7 +24,7 @@ A UAC prompt will appear — click **Yes** to grant admin privileges.
 
 ## Requirements
 
-- **Windows 10/11** with Claude Desktop installed
+- **Windows 10/11** with Claude Desktop installed (Microsoft Store version)
 - **Node.js** installed (`npx` must be available in PATH)
 - **Administrator privileges** (the script will request elevation automatically)
 

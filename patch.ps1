@@ -21,7 +21,7 @@ if (-not $IsAdmin) {
     } else {
         # Running via irm|iex — download to temp file, then re-launch as admin
         $TmpScript = Join-Path $env:TEMP "claude_rtl_patch.ps1"
-        $RepoUrl = "https://raw.githubusercontent.com/shraga89/claude-rtl-patch/main/patch.ps1"
+        $RepoUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
         Write-Host "Downloading script to temp file for elevation..." -ForegroundColor Cyan
         Invoke-RestMethod -Uri $RepoUrl -OutFile $TmpScript
         Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$TmpScript`""
