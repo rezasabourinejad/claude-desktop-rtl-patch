@@ -261,17 +261,22 @@ $RTL_INJECTION_CODE = @'
                 }
             }, true);
 
-            // Watch DOM changes
+            // Watch DOM changes (throttle, not debounce — process DURING streaming)
+            var pendingMuts = [];
             var obs = new MutationObserver(function(muts) {
-                var changed = false;
+                var dominated = false;
                 for (var i = 0; i < muts.length; i++) {
-                    if (muts[i].addedNodes.length > 0 || muts[i].type === 'characterData') { changed = true; break; }
+                    if (muts[i].addedNodes.length > 0 || muts[i].type === 'characterData') { dominated = true; break; }
                 }
-                if (!changed) return;
-                clearTimeout(window._rtlT);
+                if (!dominated) return;
+                for (var j = 0; j < muts.length; j++) pendingMuts.push(muts[j]);
+                if (window._rtlT) return; // throttle: already scheduled
                 window._rtlT = setTimeout(function() {
+                    window._rtlT = null;
+                    var toProcess = pendingMuts;
+                    pendingMuts = [];
                     var roots = new Set();
-                    muts.forEach(function(m) {
+                    toProcess.forEach(function(m) {
                         m.addedNodes.forEach(function(n) { if (n.nodeType === 1) roots.add(n); });
                         if (m.type === 'characterData' && m.target.parentElement) roots.add(m.target.parentElement);
                     });
