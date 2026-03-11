@@ -536,6 +536,21 @@ function Install-Patch {
     if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath)) { Copy-Item $ExePath "$ExePath.bak" -Force; Write-Success "claude.exe.bak created" }
     if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-Item $CoworkSvcPath "$CoworkSvcPath.bak" -Force; Write-Success "cowork-svc.exe.bak created" }
 
+    # Always restore from backup before patching — ensures clean state
+    # First run: .bak was just created from same file → copy is a no-op (safe)
+    # Re-run: restores original files → fresh install on clean files
+    Write-Step "Ensuring clean state before patching..."
+    foreach ($pair in @(
+        @{O=$AsarPath;       B="$AsarPath.bak"},
+        @{O=$ExePath;        B="$ExePath.bak"},
+        @{O=$CoworkSvcPath;  B="$CoworkSvcPath.bak"}
+    )) {
+        if (Test-Path $pair.B) {
+            Copy-Item $pair.B $pair.O -Force
+            Write-Log "Restored $(Split-Path $pair.O -Leaf) from backup"
+        }
+    }
+
     # ==========================================
     # START ATOMIC TRANSACTION (TRY/CATCH)
     # ==========================================
