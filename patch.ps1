@@ -567,25 +567,16 @@ function Install-Patch {
         if (Test-Path $BuildDir) {
             $JsFiles = Get-ChildItem -Path $BuildDir -Filter "*.js" -Recurse
             $Injected = 0
-            $Skipped = 0
             foreach ($file in $JsFiles) {
                 $content = Get-Content $file.FullName -Raw
                 if ($content -match "CLAUDE RTL PATCH START") { continue }
-
-                # Only inject into renderer files (files that use DOM/React)
-                $hasDOM = $content -match 'document\.' -or $content -match 'ReactDOM' -or $content -match 'createElement'
-                if (-not $hasDOM) {
-                    Write-Log "Skipping non-UI file: $($file.Name)"
-                    $Skipped++
-                    continue
-                }
 
                 $newContent = $RTL_INJECTION_CODE + "`n" + $content
                 [System.IO.File]::WriteAllText($file.FullName, $newContent, [System.Text.Encoding]::UTF8)
                 $Injected++
                 Write-Log "Injected RTL into: $($file.Name)"
             }
-            if ($Injected -gt 0) { Write-Success "Injected RTL JS logic into $Injected renderer file(s). Skipped $Skipped non-UI file(s)." }
+            if ($Injected -gt 0) { Write-Success "Injected RTL JS logic into $Injected file(s)." }
             else { Write-Warn "JS files already patched or not found." }
         }
 
