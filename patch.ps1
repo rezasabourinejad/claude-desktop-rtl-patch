@@ -159,6 +159,14 @@ $RTL_INJECTION_CODE = @'
                     el.style.direction = dir;
                     if (el.tagName === 'LI') {
                         el.style.listStylePosition = (dir === 'rtl') ? 'inside' : '';
+                        // Propagate RTL to parent list immediately to fix bullet position
+                        var parentList = el.closest('ul, ol');
+                        if (parentList && dir === 'rtl' && !parentList.hasAttribute('dir')) {
+                            parentList.dir = 'rtl';
+                            parentList.style.direction = 'rtl';
+                            var pl = getComputedStyle(parentList).paddingLeft;
+                            if (parseFloat(pl) > 0) { parentList.style.paddingRight = pl; parentList.style.paddingLeft = '0'; }
+                        }
                     }
                 } else {
                     if (el.hasAttribute('dir')) el.removeAttribute('dir');
@@ -228,7 +236,7 @@ $RTL_INJECTION_CODE = @'
             var s = document.createElement('style');
             s.id = 'claude-rtl-styles';
             s.textContent = [
-                'p,li,h1,h2,h3,h4,h5,h6,blockquote,td,th,summary,label,legend,dt,dd,figcaption,caption{unicode-bidi:plaintext!important;text-align:start!important}',
+                'p:not([dir]),li:not([dir]),h1:not([dir]),h2:not([dir]),h3:not([dir]),h4:not([dir]),h5:not([dir]),h6:not([dir]),blockquote:not([dir]),td:not([dir]),th:not([dir]),summary:not([dir]),label:not([dir]),legend:not([dir]),dt:not([dir]),dd:not([dir]),figcaption:not([dir]),caption:not([dir]){unicode-bidi:plaintext!important;text-align:start!important}',
                 'pre,.code-block__code,.relative.group\\/copy{unicode-bidi:embed!important;direction:ltr!important;text-align:left!important}',
                 'code{unicode-bidi:isolate!important;direction:ltr!important}',
                 '[dir="rtl"]{direction:rtl!important}[dir="ltr"]{direction:ltr!important}'
