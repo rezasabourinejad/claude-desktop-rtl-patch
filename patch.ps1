@@ -33,6 +33,7 @@ if (-not $IsAdmin) {
 # GLOBAL SETTINGS & RTL JS PAYLOAD
 # -----------------------------------------------------------------------------
 $ErrorActionPreference = "Stop"
+Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue
 $global:TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "claude_rtl_patch_tmp"
 
 # Exact JS logic from r.js
@@ -717,6 +718,36 @@ function Compute-AsarHash($AsarPath) {
     return $hashStr
 }
 
+function Create-UpdateShortcut {
+    Write-Step "Creating Quick Update Shortcut..."
+    Try {
+        $WshShell = New-Object -comObject WScript.Shell
+        # הגדרת המיקום לשולחן העבודה
+        $DesktopPath = [Environment]::GetFolderPath('Desktop')
+        $ShortcutPath = Join-Path $DesktopPath "Update Claude RTL.lnk"
+        
+        $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+        $Shortcut.TargetPath = "powershell.exe"
+        
+        # הפקודה המדויקת שמושכת את ההתקנה העדכנית מהרשת ללא שמירת קובץ מקומי
+        $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1 | iex`""
+        $Shortcut.Description = "Download and apply the latest Claude Desktop RTL patch"
+        
+        # ניסיון להשתמש באייקון של קלוד כדי שייראה יפה, אם לא - אייקון ברירת מחדל של PowerShell
+        $ClaudeDir = Find-ClaudeDir
+        if ($ClaudeDir -and (Test-Path (Join-Path $ClaudeDir "app\claude.exe"))) {
+            $Shortcut.IconLocation = "$(Join-Path $ClaudeDir "app\claude.exe"),0"
+        } else {
+            $Shortcut.IconLocation = "powershell.exe,0"
+        }
+        
+        $Shortcut.Save()
+        Write-Success "Shortcut created successfully on your Desktop: $ShortcutPath"
+    } Catch {
+        Write-Warn "Failed to create shortcut: $($_.Exception.Message)"
+    }
+}
+
 # -----------------------------------------------------------------------------
 # CORE PATCHING LOGIC (WITH ATOMIC FALLBACK)
 # -----------------------------------------------------------------------------
@@ -751,6 +782,7 @@ function Install-Patch {
     Take-Ownership $ResourcesDir
 
     Write-Step "Creating secure backups..."
+    Wait-FileUnlock -Path $ExePath -TimeoutSeconds 15
     if (-not (Test-Path "$AsarPath.bak")) { Copy-Item $AsarPath "$AsarPath.bak" -Force; Write-Success "app.asar.bak created" }
     if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath)) { Copy-Item $ExePath "$ExePath.bak" -Force; Write-Success "claude.exe.bak created" }
     if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-Item $CoworkSvcPath "$CoworkSvcPath.bak" -Force; Write-Success "cowork-svc.exe.bak created" }
@@ -765,6 +797,7 @@ function Install-Patch {
         @{O=$CoworkSvcPath;  B="$CoworkSvcPath.bak"}
     )) {
         if (Test-Path $pair.B) {
+            Wait-FileUnlock -Path $pair.O -TimeoutSeconds 15
             Copy-Item $pair.B $pair.O -Force
             Write-Log "Restored $(Split-Path $pair.O -Leaf) from backup"
         }
@@ -946,6 +979,11 @@ function Install-Patch {
         Write-Host " PATCH INSTALLATION COMPLETED SUCCESSFULLY! ENJOY!" -ForegroundColor Green
         Write-Host "=======================================================`n" -ForegroundColor Green
 
+        $shortcutPrompt = Read-Host "Do you want to create a Desktop shortcut to easily re-apply updates in the future? (Y/n)"
+        if ($shortcutPrompt -ne 'n' -and $shortcutPrompt -ne 'N') {
+            Create-UpdateShortcut
+        }
+
     } Catch {
         # ==========================================
         # FALLBACK / ROLLBACK MECHANISM
@@ -1039,9 +1077,10 @@ function Show-Menu {
     Write-Host "`nSelect an action:"
     Write-Host "  1. Install Smart RTL Patch (Full Hebrew Support)" -ForegroundColor White
     Write-Host "  2. Restore Original State (Remove Patch)" -ForegroundColor White
-    Write-Host "  3. Exit" -ForegroundColor White
+    Write-Host "  3. Create 'Quick Update' Desktop Shortcut" -ForegroundColor Green
+    Write-Host "  4. Exit" -ForegroundColor White
 
-    $choice = Read-Host "`nEnter your choice (1/2/3)"
+    $choice = Read-Host "`nEnter your choice (1/2/3/4)"
     
     if ($choice -eq '1' -or $choice -eq '2') {
         Write-Host "`nWARNING: This will automatically close Claude Desktop and its background services." -ForegroundColor Yellow
@@ -1064,7 +1103,13 @@ function Show-Menu {
         Write-Host "`nPress Enter to exit..."
         $null = Read-Host
     }
-    elseif ($choice -eq '3') { Exit }
+    elseif ($choice -eq '3') {
+        Create-UpdateShortcut
+        Write-Host "`nPress Enter to return to menu..."
+        $null = Read-Host
+        Show-Menu
+    }
+    elseif ($choice -eq '4') { Exit }
     else { Show-Menu }
 }
 
