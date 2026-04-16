@@ -466,7 +466,12 @@ $RTL_INJECTION_CODE = @'
     try {
         if (typeof document === 'undefined' || typeof localStorage === 'undefined') return;
         var FLAG_KEY = 'claude-rtl-patch-welcomed';
-        var VERSION = '1'; // Bump to re-show on future patch updates
+        // Tie the welcome banner to the Claude Desktop version reported in the UA
+        // (e.g. "...Claude/1.3036.0 Chrome/..."). On every Claude release the
+        // version changes, the saved flag stops matching, and the banner shows
+        // once for the new version — no manual bump needed.
+        var versionMatch = (navigator.userAgent || '').match(/Claude\/([\d.]+)/);
+        var VERSION = versionMatch ? versionMatch[1] : '0';
         if (localStorage.getItem(FLAG_KEY) === VERSION) return;
 
         function show() {
