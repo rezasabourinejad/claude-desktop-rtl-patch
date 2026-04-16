@@ -312,6 +312,138 @@ $RTL_INJECTION_CODE = @'
     } catch(e) { console.error('[Claude RTL]', e); }
 })();
 // --- CLAUDE RTL PATCH END ---
+// --- CLAUDE WCO FIX START ---
+;(function() {
+    'use strict';
+    try {
+        if (typeof navigator === 'undefined' || typeof document === 'undefined') return;
+        // Feature-detect. If Anthropic ships a native fix (disables titleBarOverlay
+        // or handles padding themselves), this whole block becomes a silent no-op.
+        if (!('windowControlsOverlay' in navigator)) return;
+        var wco = navigator.windowControlsOverlay;
+
+        var STYLE_ID = 'claude-wco-fix';
+        var TARGET_ATTR = 'data-claude-wco-target';
+        var retryCount = 0;
+        var MAX_RETRIES = 20; // ~10 seconds total at 500ms interval
+
+        function removeAll() {
+            var style = document.getElementById(STYLE_ID);
+            if (style) style.remove();
+            var marked = document.querySelectorAll('[' + TARGET_ATTR + ']');
+            for (var i = 0; i < marked.length; i++) {
+                marked[i].removeAttribute(TARGET_ATTR);
+            }
+        }
+
+        // Find the top bar container by physical position, not by tag/class/role.
+        // Criteria: anchored at top-left, spanning most of viewport width.
+        function findTopBar(overlayWidth, overlayHeight) {
+            // Test point: just PAST the overlay area, at the title bar's vertical center.
+            // That's where claude.ai's actual top bar content sits.
+            var testX = Math.min(overlayWidth + 20, window.innerWidth - 20);
+            var testY = Math.max(2, Math.min(overlayHeight / 2, 15));
+            var hit = document.elementFromPoint(testX, testY);
+            if (!hit) return null;
+
+            // Walk up: find the WIDEST ancestor still anchored at top-left.
+            var el = hit;
+            var best = null;
+            while (el && el !== document.body && el !== document.documentElement) {
+                var r = el.getBoundingClientRect();
+                if (r.top <= 4 && r.left <= 4 && r.width >= window.innerWidth * 0.7) {
+                    best = el; // Keep walking — prefer a wider qualifying ancestor
+                }
+                el = el.parentElement;
+            }
+            return best;
+        }
+
+        function applyFix() {
+            try {
+                var rect = (typeof wco.getTitlebarAreaRect === 'function')
+                    ? wco.getTitlebarAreaRect() : null;
+
+                // No-op cases: overlay not visible, no rect, or x <= 0 (LTR Windows).
+                if (!wco.visible || !rect || rect.width === 0 || rect.x <= 0) {
+                    removeAll();
+                    return true;
+                }
+                var padStart = Math.round(rect.x);
+                var height = Math.round(rect.height) || 40;
+
+                var topBar = findTopBar(padStart, height);
+                if (!topBar) return false; // Signal caller to retry later
+
+                // Clear stale markers (previous target may have unmounted), mark fresh one.
+                var prevMarked = document.querySelectorAll('[' + TARGET_ATTR + ']');
+                for (var i = 0; i < prevMarked.length; i++) {
+                    if (prevMarked[i] !== topBar) prevMarked[i].removeAttribute(TARGET_ATTR);
+                }
+                topBar.setAttribute(TARGET_ATTR, 'true');
+
+                var style = document.getElementById(STYLE_ID);
+                if (!style) {
+                    style = document.createElement('style');
+                    style.id = STYLE_ID;
+                    document.head.appendChild(style);
+                }
+                // Single rule bound to our private attribute — zero collision risk
+                // with any selector claude.ai might define.
+                style.textContent =
+                    '[' + TARGET_ATTR + ']{padding-inline-start:' + padStart +
+                    'px!important;box-sizing:border-box!important}';
+                return true;
+            } catch(e) {
+                console.error('[Claude WCO Fix]', e);
+                return true; // Error → don't spam retries
+            }
+        }
+
+        function scheduleAttempt() {
+            var ok = applyFix();
+            if (ok === false && retryCount++ < MAX_RETRIES) {
+                setTimeout(scheduleAttempt, 500);
+            }
+        }
+
+        function attach() {
+            scheduleAttempt();
+
+            // Chromium fires geometrychange on maximize/restore/DPI change.
+            if (typeof wco.addEventListener === 'function') {
+                wco.addEventListener('geometrychange', function() {
+                    retryCount = 0;
+                    applyFix();
+                });
+            }
+
+            // React/SPA re-renders can unmount the top bar. Re-apply when that
+            // happens. Debounced to 200ms; only actually re-runs if the marked
+            // target is no longer in the DOM.
+            var debounceTimer = null;
+            var obs = new MutationObserver(function() {
+                if (debounceTimer) return;
+                debounceTimer = setTimeout(function() {
+                    debounceTimer = null;
+                    var marked = document.querySelector('[' + TARGET_ATTR + ']');
+                    if (!marked || !document.body.contains(marked)) {
+                        retryCount = 0;
+                        applyFix();
+                    }
+                }, 200);
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', attach);
+        } else {
+            attach();
+        }
+    } catch(e) { console.error('[Claude WCO Fix]', e); }
+})();
+// --- CLAUDE WCO FIX END ---
 '@
 
 # -----------------------------------------------------------------------------
