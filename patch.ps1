@@ -528,18 +528,18 @@ function Write-Warn($msg)    { Write-Host "  [!] $msg" -ForegroundColor Yellow }
 
 # Pure Binary Search equivalent to Python's bytearray.find()
 function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0) {
-    if ($Needle.Length -eq 0 -or $Haystack.Length -lt $Needle.Length) { return -1 }
-    for ($i = $StartIndex; $i -le ($Haystack.Length - $Needle.Length); $i++) {
-        $match = $true
-        for ($j = 0; $j -lt $Needle.Length; $j++) {
-            if ($Haystack[$i + $j] -ne $Needle[$j]) {
-                $match = $false
-                break
-            }
-        }
-        if ($match) { return $i }
-    }
-    return -1
+    # Fast path: convert both arrays to ISO-8859-1 strings (1 byte ↔ 1 char, lossless
+    # for all 256 byte values) and delegate to String.IndexOf, which is implemented in
+    # native code. This replaces a nested PowerShell byte-by-byte loop that was the
+    # dominant silent period during patching (tens of MB × needle length in pure PS
+    # could take ~30–60s on claude.exe).
+    if ($Needle -eq $null -or $Needle.Length -eq 0 -or $Haystack -eq $null -or $Haystack.Length -lt $Needle.Length) { return -1 }
+    if ($StartIndex -lt 0) { $StartIndex = 0 }
+    if ($StartIndex -gt ($Haystack.Length - $Needle.Length)) { return -1 }
+    $enc = [System.Text.Encoding]::GetEncoding(28591)  # ISO-8859-1 / Latin-1, byte-preserving
+    $hayStr = $enc.GetString($Haystack)
+    $needleStr = $enc.GetString($Needle)
+    return $hayStr.IndexOf($needleStr, $StartIndex, [System.StringComparison]::Ordinal)
 }
 
 # -----------------------------------------------------------------------------
@@ -1171,29 +1171,33 @@ function Install-Patch {
 
             # 4. SWAP ALL HASHES IN CLAUDE.EXE (PURE BYTE SEARCH LIKE r.js)
             Wait-FileUnlock $ExePath
+            Write-Log "Reading claude.exe into memory..."
             $ExeBytes = [System.IO.File]::ReadAllBytes($SourceExe)
+            Write-Log "Scanning $([math]::Round($ExeBytes.Length/1MB,1)) MB of claude.exe for ASAR hash matches..."
             $OldHashBytes = [System.Text.Encoding]::ASCII.GetBytes($OldHash)
             $NewHashBytes = [System.Text.Encoding]::ASCII.GetBytes($NewHash)
-            
+
             $OffsetExe = 0
             $Replacements = 0
 
             while ($true) {
                 $Idx = Find-Bytes -Haystack $ExeBytes -Needle $OldHashBytes -StartIndex $OffsetExe
                 if ($Idx -eq -1) { break }
-                
+
                 [Array]::Copy($NewHashBytes, 0, $ExeBytes, $Idx, $NewHashBytes.Length)
                 $OffsetExe = $Idx + $OldHashBytes.Length
                 $Replacements++
             }
 
             if ($Replacements -gt 0) {
+                Write-Log "Writing patched claude.exe to disk..."
                 [System.IO.File]::WriteAllBytes($ExePath, $ExeBytes)
                 Write-Success "Replaced $Replacements ASAR hash(es) in claude.exe"
             } else {
                 Write-Warn "Old hash not found in claude.exe. Skipping hash replacement."
             }
 
+            Write-Log "Re-signing claude.exe with self-signed certificate (this can take several seconds)..."
             $SignResult = Set-AuthenticodeSignature -FilePath $ExePath -Certificate $Cert -HashAlgorithm SHA256
             if ($SignResult.Status -eq 'Valid') { Write-Success "Successfully re-signed claude.exe" }
             else { throw "Re-signing claude.exe failed: $($SignResult.Status)" }
@@ -1202,15 +1206,16 @@ function Install-Patch {
             Wait-FileUnlock $CoworkSvcPath
             $Diff = $OldCertSize - $NewCertBytes.Length
             Write-Log "Swapping cowork-svc cert and padding with $Diff bytes of 0x00..."
-            
+
             $PaddedCert = New-Object byte[] $OldCertSize
             [Array]::Copy($NewCertBytes, 0, $PaddedCert, 0, $NewCertBytes.Length)
-            
+
             [Array]::Copy($PaddedCert, 0, $SvcBytes, $StartPos, $OldCertSize)
             [System.IO.File]::WriteAllBytes($CoworkSvcPath, $SvcBytes)
             Write-Success "Binary cert replacement completed in cowork-svc.exe"
 
             # 6. SIGN COWORK-SVC.EXE
+            Write-Log "Re-signing cowork-svc.exe with self-signed certificate (this can take several seconds)..."
             $SignResult2 = Set-AuthenticodeSignature -FilePath $CoworkSvcPath -Certificate $Cert -HashAlgorithm SHA256
             if ($SignResult2.Status -eq 'Valid') { Write-Success "Successfully re-signed cowork-svc.exe" }
             else { throw "Re-signing cowork-svc.exe failed: $($SignResult2.Status)" }
@@ -1230,9 +1235,9 @@ function Install-Patch {
         Write-Host "=======================================================`n" -ForegroundColor Green
 
         if (-not $Auto) {
-            $shortcutPrompt = Read-Host "Do you want to create a Desktop shortcut to easily re-apply updates in the future? (Y/n)"
-            if ($shortcutPrompt -ne 'n' -and $shortcutPrompt -ne 'N') {
-                Create-UpdateShortcut
+            $autoPatchPrompt = Read-Host "Do you want to enable Auto Re-Patch after each Claude update? (Y/n)"
+            if ($autoPatchPrompt -ne 'n' -and $autoPatchPrompt -ne 'N') {
+                try { Install-AutoUpdateTask } catch { Write-Warn "Failed to install auto-patch task: $($_.Exception.Message)" }
             }
         }
 
