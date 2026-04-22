@@ -21,21 +21,18 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $IsAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
     $autoArg = if ($Auto) { ' -Auto' } else { '' }
-    $ScriptPath = $MyInvocation.MyCommand.Path
-    if ($ScriptPath) {
-        # Running as a .ps1 file — re-launch that file as admin
-        Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`"$autoArg"
-    } else {
-        # Running via irm|iex — download to temp file, then re-launch as admin.
-        # Write with UTF-8 BOM so `powershell.exe -File` parses Hebrew/box-drawing chars
-        # correctly (without BOM, PSv5.1 falls back to ANSI codepage and fails to parse).
-        $TmpScript = Join-Path $env:TEMP "claude_rtl_patch.ps1"
-        $RepoUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
-        Write-Host "Downloading script to temp file for elevation..." -ForegroundColor Cyan
-        $content = Invoke-RestMethod -Uri $RepoUrl
-        [System.IO.File]::WriteAllText($TmpScript, $content, [System.Text.UTF8Encoding]::new($true))
-        Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$TmpScript`"$autoArg"
-    }
+    # Always download to TEMP and save with UTF-8 BOM before elevating. This unifies both
+    # invocation paths (local .ps1 file and `irm | iex`) and guarantees the elevated
+    # PowerShell receives a file that PSv5.1 can parse — without a BOM it falls back to
+    # the ANSI codepage and fails on Hebrew/box-drawing characters. `-NoExit` keeps the
+    # elevated window open so early errors (parse, init, missing Claude install) stay
+    # visible instead of flashing and closing.
+    $TmpScript = Join-Path $env:TEMP "claude_rtl_patch.ps1"
+    $RepoUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
+    Write-Host "Downloading script to temp file for elevation..." -ForegroundColor Cyan
+    $content = Invoke-RestMethod -Uri $RepoUrl
+    [System.IO.File]::WriteAllText($TmpScript, $content, [System.Text.UTF8Encoding]::new($true))
+    Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -NoExit -ExecutionPolicy Bypass -File `"$TmpScript`"$autoArg"
     Exit
 }
 
