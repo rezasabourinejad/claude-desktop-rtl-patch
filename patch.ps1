@@ -26,11 +26,14 @@ if (-not $IsAdmin) {
         # Running as a .ps1 file — re-launch that file as admin
         Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`"$autoArg"
     } else {
-        # Running via irm|iex — download to temp file, then re-launch as admin
+        # Running via irm|iex — download to temp file, then re-launch as admin.
+        # Write with UTF-8 BOM so `powershell.exe -File` parses Hebrew/box-drawing chars
+        # correctly (without BOM, PSv5.1 falls back to ANSI codepage and fails to parse).
         $TmpScript = Join-Path $env:TEMP "claude_rtl_patch.ps1"
         $RepoUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
         Write-Host "Downloading script to temp file for elevation..." -ForegroundColor Cyan
-        Invoke-RestMethod -Uri $RepoUrl -OutFile $TmpScript
+        $content = Invoke-RestMethod -Uri $RepoUrl
+        [System.IO.File]::WriteAllText($TmpScript, $content, [System.Text.UTF8Encoding]::new($true))
         Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$TmpScript`"$autoArg"
     }
     Exit
@@ -821,7 +824,9 @@ $stateDir       = Join-Path $env:ProgramData "ClaudeRtlPatch"
 $stateFile      = Join-Path $stateDir "state.json"
 $logFile        = Join-Path $stateDir "watcher.log"
 $lastActionFile = Join-Path $stateDir "last-action.txt"
-$repoUrl        = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
+# Use install.ps1 — same path as the manual "Update Claude RTL" desktop shortcut.
+# install.ps1 handles BOM-encoding and elevation; we just signal Auto mode via env var.
+$installUrl     = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1"
 
 function Write-WLog($msg) {
     try {
@@ -884,37 +889,30 @@ function Invoke-AutoPatch($newVer, $exePath) {
     }
     (Get-Date).ToString('o') | Set-Content $lastActionFile -Encoding UTF8
 
-    Write-WLog "Detected Claude v$newVer at $exePath -- preparing auto-patch"
-
-    # Download patch.ps1 FIRST. If network fails, Claude keeps running undisturbed.
-    $tmpScript = Join-Path $env:TEMP "claude_rtl_auto_patch.ps1"
-    try {
-        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-        Invoke-WebRequest -Uri $repoUrl -OutFile $tmpScript -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Write-WLog "Download failed, leaving Claude untouched: $($_.Exception.Message)"
-        Show-Toast "Claude RTL auto-patch deferred" "Could not download patch. Will retry on next launch."
-        return
-    }
-
+    Write-WLog "Detected Claude v$newVer at $exePath -- launching install.ps1 (Auto mode)"
     Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
 
-    # Kill processes after download succeeded.
+    # Kill running Claude processes for snappy UX (patch.ps1 will kill again properly via Stop-ClaudeServices).
     Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
     try {
-        # Spawn a VISIBLE PowerShell window (the watcher itself runs hidden — child gets normal window).
-        # Inherits the watcher's elevated token, so no UAC prompt.
-        Start-Process -FilePath "powershell.exe" -ArgumentList @(
-            '-NoProfile',
-            '-ExecutionPolicy', 'Bypass',
-            '-File', "`"$tmpScript`"",
-            '-Auto'
-        ) | Out-Null
-        Write-WLog "Patch window launched (script: $tmpScript)"
+        # Use the EXACT same command as the manual "Update Claude RTL" desktop shortcut.
+        # install.ps1 downloads patch.ps1 with UTF-8 BOM and re-launches it elevated.
+        # The CLAUDE_RTL_AUTO env var propagates through the chain and patch.ps1 picks it up
+        # via its env-var fallback (skipping the menu and running Install-Patch directly).
+        $env:CLAUDE_RTL_AUTO = '1'
+        Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList @(
+                '-NoProfile',
+                '-ExecutionPolicy', 'Bypass',
+                '-Command', "irm $installUrl | iex"
+            ) | Out-Null
+        Write-WLog "Spawned: powershell -Command 'irm install.ps1 | iex' (CLAUDE_RTL_AUTO=1)"
     } catch {
-        Write-WLog "Failed to launch patch window: $($_.Exception.Message)"
+        Write-WLog "Failed to launch installer: $($_.Exception.Message)"
         Show-Toast "Auto-patch FAILED to start" "Please run patch.ps1 manually as Administrator. See watcher.log."
+    } finally {
+        Remove-Item Env:CLAUDE_RTL_AUTO -ErrorAction SilentlyContinue
     }
 }
 
