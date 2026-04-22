@@ -6,6 +6,12 @@
     Handles ASAR repackaging, executable hash patching, and cowork-svc binary certificate swapping.
     Strictly uses PURE BYTE-ARRAY manipulation matching the original Python script.
 #>
+param(
+    [switch]$Auto
+)
+
+# Env-var fallback for `irm | iex` invocations where param binding is not possible.
+if (-not $Auto -and $env:CLAUDE_RTL_AUTO -eq '1') { $Auto = $true }
 
 # -----------------------------------------------------------------------------
 # AUTO-ELEVATION: Request Administrator Privileges Automatically
@@ -14,17 +20,18 @@
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
+    $autoArg = if ($Auto) { ' -Auto' } else { '' }
     $ScriptPath = $MyInvocation.MyCommand.Path
     if ($ScriptPath) {
         # Running as a .ps1 file — re-launch that file as admin
-        Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+        Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`"$autoArg"
     } else {
         # Running via irm|iex — download to temp file, then re-launch as admin
         $TmpScript = Join-Path $env:TEMP "claude_rtl_patch.ps1"
         $RepoUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
         Write-Host "Downloading script to temp file for elevation..." -ForegroundColor Cyan
         Invoke-RestMethod -Uri $RepoUrl -OutFile $TmpScript
-        Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$TmpScript`""
+        Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$TmpScript`"$autoArg"
     }
     Exit
 }
@@ -535,6 +542,50 @@ function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0) {
     return -1
 }
 
+# -----------------------------------------------------------------------------
+# AUTO-UPDATE STATE: shared with the watcher Scheduled Task
+# -----------------------------------------------------------------------------
+$global:RtlStateDir  = Join-Path $env:ProgramData "ClaudeRtlPatch"
+$global:RtlStateFile = Join-Path $global:RtlStateDir "state.json"
+$global:RtlTaskName  = "ClaudeRtlPatchWatcher"
+
+function Get-ClaudeVersionFromPath {
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    $leaf = Split-Path -Leaf $Path
+    if ($leaf -match '^Claude_(\d+(?:\.\d+){1,3})_') {
+        try { return [Version]$matches[1] } catch { return $null }
+    }
+    # Path may also be the inner app dir; walk up one level.
+    $parent = Split-Path -Parent $Path
+    if ($parent) {
+        $leaf2 = Split-Path -Leaf $parent
+        if ($leaf2 -match '^Claude_(\d+(?:\.\d+){1,3})_') {
+            try { return [Version]$matches[1] } catch { return $null }
+        }
+    }
+    return $null
+}
+
+function Save-PatchState {
+    param([Parameter(Mandatory)][string]$InstallPath)
+    try {
+        if (-not (Test-Path $global:RtlStateDir)) {
+            New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
+        }
+        $ver = Get-ClaudeVersionFromPath -Path $InstallPath
+        $state = [ordered]@{
+            patchedVersion     = if ($ver) { $ver.ToString() } else { $null }
+            patchedInstallPath = $InstallPath
+            patchedAt          = (Get-Date).ToUniversalTime().ToString("o")
+        }
+        $state | ConvertTo-Json | Set-Content -Path $global:RtlStateFile -Encoding UTF8
+        Write-Log "Patch state recorded at $global:RtlStateFile (version: $($state.patchedVersion))"
+    } catch {
+        Write-Warn "Failed to save patch state: $($_.Exception.Message)"
+    }
+}
+
 function Find-ClaudeDir {
     $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' } | Select-Object -First 1
     if ($pkg) { return $pkg.InstallLocation }
@@ -745,6 +796,208 @@ function Create-UpdateShortcut {
         Write-Success "Shortcut created successfully on your Desktop: $ShortcutPath"
     } Catch {
         Write-Warn "Failed to create shortcut: $($_.Exception.Message)"
+    }
+}
+
+# -----------------------------------------------------------------------------
+# AUTO-UPDATE WATCHER (Scheduled Task)
+# Watches for new claude.exe processes from a higher version path and triggers
+# the patch automatically. The watcher script is embedded as a base64-encoded
+# command in the Scheduled Task XML — no extra files on disk.
+# -----------------------------------------------------------------------------
+function Install-AutoUpdateTask {
+    Write-Step "Installing Auto-Update Watcher (Scheduled Task)..."
+
+    if (-not (Test-Path $global:RtlStateFile)) {
+        Write-Warn "No patch state found at $global:RtlStateFile."
+        Write-Warn "Run option 1 (Install Smart RTL Patch) first so the watcher knows which version is patched."
+        return
+    }
+
+    # Single-quoted here-string: $ signs are preserved literally for runtime evaluation inside the watcher.
+    $watcher = @'
+$ErrorActionPreference = "Continue"
+$stateDir       = Join-Path $env:ProgramData "ClaudeRtlPatch"
+$stateFile      = Join-Path $stateDir "state.json"
+$logFile        = Join-Path $stateDir "watcher.log"
+$lastActionFile = Join-Path $stateDir "last-action.txt"
+$repoUrl        = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
+
+function Write-WLog($msg) {
+    try {
+        if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+        if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 1MB) {
+            Move-Item $logFile "$logFile.old" -Force
+        }
+        "$([DateTime]::Now.ToString('o'))  $msg" | Out-File -Append -FilePath $logFile -Encoding UTF8
+    } catch {}
+}
+
+function Get-VerFromPath($p) {
+    if (-not $p) { return $null }
+    $cur = $p
+    for ($i = 0; $i -lt 4 -and $cur; $i++) {
+        $leaf = Split-Path -Leaf $cur
+        if ($leaf -match '^Claude_(\d+(?:\.\d+){1,3})_') {
+            try { return [Version]$matches[1] } catch { return $null }
+        }
+        $cur = Split-Path -Parent $cur
+    }
+    return $null
+}
+
+function Show-Toast($title, $body) {
+    try {
+        [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
+        [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime]
+        $safeTitle = [System.Security.SecurityElement]::Escape($title)
+        $safeBody  = [System.Security.SecurityElement]::Escape($body)
+        $xmlStr = "<toast><visual><binding template='ToastGeneric'><text>$safeTitle</text><text>$safeBody</text></binding></visual></toast>"
+        $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $xml.LoadXml($xmlStr)
+        $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Claude RTL Patch").Show($toast)
+    } catch {
+        Write-WLog "Toast failed: $($_.Exception.Message)"
+    }
+}
+
+function Get-PatchedVer {
+    if (-not (Test-Path $stateFile)) { return $null }
+    try {
+        $s = Get-Content $stateFile -Raw | ConvertFrom-Json
+        if ($s.patchedVersion) { return [Version]$s.patchedVersion }
+    } catch { Write-WLog "State read error: $($_.Exception.Message)" }
+    return $null
+}
+
+function Invoke-AutoPatch($newVer, $exePath) {
+    # Throttle: skip if we acted within the last 90 seconds (avoids loops on multi-process Electron startup).
+    if (Test-Path $lastActionFile) {
+        try {
+            $last = [DateTime]::Parse((Get-Content $lastActionFile -Raw))
+            if (((Get-Date) - $last).TotalSeconds -lt 90) {
+                Write-WLog "Throttled (last action $([int]((Get-Date)-$last).TotalSeconds)s ago)"
+                return
+            }
+        } catch {}
+    }
+    (Get-Date).ToString('o') | Set-Content $lastActionFile -Encoding UTF8
+
+    Write-WLog "Detected Claude v$newVer at $exePath -- preparing auto-patch"
+
+    # Download patch.ps1 FIRST. If network fails, Claude keeps running undisturbed.
+    $tmpScript = Join-Path $env:TEMP "claude_rtl_auto_patch.ps1"
+    try {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+        Invoke-WebRequest -Uri $repoUrl -OutFile $tmpScript -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Write-WLog "Download failed, leaving Claude untouched: $($_.Exception.Message)"
+        Show-Toast "Claude RTL auto-patch deferred" "Could not download patch. Will retry on next launch."
+        return
+    }
+
+    Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
+
+    # Kill processes after download succeeded.
+    Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    try {
+        # Spawn a VISIBLE PowerShell window (the watcher itself runs hidden — child gets normal window).
+        # Inherits the watcher's elevated token, so no UAC prompt.
+        Start-Process -FilePath "powershell.exe" -ArgumentList @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', "`"$tmpScript`"",
+            '-Auto'
+        ) | Out-Null
+        Write-WLog "Patch window launched (script: $tmpScript)"
+    } catch {
+        Write-WLog "Failed to launch patch window: $($_.Exception.Message)"
+        Show-Toast "Auto-patch FAILED to start" "Please run patch.ps1 manually as Administrator. See watcher.log."
+    }
+}
+
+function Test-AndPatch($exePath) {
+    if (-not $exePath) { return }
+    $newVer = Get-VerFromPath $exePath
+    if (-not $newVer) { return }
+    $patchedVer = Get-PatchedVer
+    if (-not $patchedVer) { Write-WLog "No state file; ignoring v$newVer"; return }
+    if ($newVer -gt $patchedVer) { Invoke-AutoPatch -newVer $newVer -exePath $exePath }
+}
+
+Write-WLog "Watcher started (PID $PID, user $env:USERNAME)"
+Write-WLog "Currently patched version: $(Get-PatchedVer)"
+
+# Initial sweep — Claude might already be running from a newer version when the watcher starts.
+try {
+    $existing = Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
+    if ($existing) { Test-AndPatch $existing.Path }
+} catch {}
+
+$query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name = 'claude.exe'"
+Register-CimIndicationEvent -Query $query -SourceIdentifier "ClaudeProcessCreated" | Out-Null
+Write-WLog "WMI subscription active. Idling..."
+
+while ($true) {
+    $ev = Wait-Event -SourceIdentifier "ClaudeProcessCreated" -Timeout 3600
+    if ($null -eq $ev) { continue }
+    try {
+        $p = $ev.SourceEventArgs.NewEvent.TargetInstance.ExecutablePath
+        Test-AndPatch $p
+    } catch {
+        Write-WLog "Event handler error: $($_.Exception.Message)"
+    } finally {
+        Remove-Event -EventIdentifier $ev.EventIdentifier
+    }
+}
+'@
+
+    Try {
+        $bytes   = [System.Text.Encoding]::Unicode.GetBytes($watcher)
+        $encoded = [Convert]::ToBase64String($bytes)
+
+        $userName  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encoded"
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $userName
+        $settings  = New-ScheduledTaskSettingsSet `
+            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+            -MultipleInstances IgnoreNew -StartWhenAvailable `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        $principal = New-ScheduledTaskPrincipal -UserId $userName `
+            -RunLevel Highest -LogonType Interactive
+
+        Register-ScheduledTask -TaskName $global:RtlTaskName `
+            -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+            -Description "Detects Claude Desktop updates and re-applies the RTL patch automatically." `
+            -Force | Out-Null
+
+        Start-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
+        Write-Success "Scheduled Task '$global:RtlTaskName' installed and started."
+        Write-Success "Watcher logs: $(Join-Path $global:RtlStateDir 'watcher.log')"
+        Write-Success "It will run automatically on every logon (and is now active for this session)."
+    } Catch {
+        Write-Warn "Failed to install scheduled task: $($_.Exception.Message)"
+    }
+}
+
+function Uninstall-AutoUpdateTask {
+    Write-Step "Removing Auto-Update Watcher..."
+    Try {
+        $existing = Get-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
+        if (-not $existing) {
+            Write-Warn "Scheduled Task '$global:RtlTaskName' is not installed."
+            return
+        }
+        Stop-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $global:RtlTaskName -Confirm:$false -ErrorAction Stop
+        Write-Success "Scheduled Task '$global:RtlTaskName' removed."
+        Write-Log "State file at $global:RtlStateFile was kept. Use option 2 (Restore) to remove all state."
+    } Catch {
+        Write-Warn "Failed to remove scheduled task: $($_.Exception.Message)"
     }
 }
 
@@ -975,13 +1228,17 @@ function Install-Patch {
         if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
         Start-ClaudeServices
         
+        Save-PatchState -InstallPath $ClaudeDir
+
         Write-Host "`n=======================================================" -ForegroundColor Green
         Write-Host " PATCH INSTALLATION COMPLETED SUCCESSFULLY! ENJOY!" -ForegroundColor Green
         Write-Host "=======================================================`n" -ForegroundColor Green
 
-        $shortcutPrompt = Read-Host "Do you want to create a Desktop shortcut to easily re-apply updates in the future? (Y/n)"
-        if ($shortcutPrompt -ne 'n' -and $shortcutPrompt -ne 'N') {
-            Create-UpdateShortcut
+        if (-not $Auto) {
+            $shortcutPrompt = Read-Host "Do you want to create a Desktop shortcut to easily re-apply updates in the future? (Y/n)"
+            if ($shortcutPrompt -ne 'n' -and $shortcutPrompt -ne 'N') {
+                Create-UpdateShortcut
+            }
         }
 
     } Catch {
@@ -1078,10 +1335,12 @@ function Show-Menu {
     Write-Host "  1. Install Smart RTL Patch (Full Hebrew Support)" -ForegroundColor White
     Write-Host "  2. Restore Original State (Remove Patch)" -ForegroundColor White
     Write-Host "  3. Create 'Quick Update' Desktop Shortcut" -ForegroundColor Green
-    Write-Host "  4. Exit" -ForegroundColor White
+    Write-Host "  4. Enable Auto Re-Patch After Each Claude Update (Background Service)" -ForegroundColor Green
+    Write-Host "  5. Disable Auto Re-Patch Service" -ForegroundColor White
+    Write-Host "  6. Exit" -ForegroundColor White
 
-    $choice = Read-Host "`nEnter your choice (1/2/3/4)"
-    
+    $choice = Read-Host "`nEnter your choice (1/2/3/4/5/6)"
+
     if ($choice -eq '1' -or $choice -eq '2') {
         Write-Host "`nWARNING: This will automatically close Claude Desktop and its background services." -ForegroundColor Yellow
         $confirm = Read-Host "Do you want to continue? (Y/n)"
@@ -1109,9 +1368,38 @@ function Show-Menu {
         $null = Read-Host
         Show-Menu
     }
-    elseif ($choice -eq '4') { Exit }
+    elseif ($choice -eq '4') {
+        try { Install-AutoUpdateTask } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+        Write-Host "`nPress Enter to return to menu..."
+        $null = Read-Host
+        Show-Menu
+    }
+    elseif ($choice -eq '5') {
+        try { Uninstall-AutoUpdateTask } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+        Write-Host "`nPress Enter to return to menu..."
+        $null = Read-Host
+        Show-Menu
+    }
+    elseif ($choice -eq '6') { Exit }
     else { Show-Menu }
 }
 
 # Start the application
-Show-Menu
+if ($Auto) {
+    Write-Host "`n=======================================================" -ForegroundColor Cyan
+    Write-Host "  AUTO RE-PATCH MODE (triggered by Claude update)" -ForegroundColor Cyan
+    Write-Host "=======================================================`n" -ForegroundColor Cyan
+    $exitCode = 0
+    try {
+        Install-Patch
+    } catch {
+        Write-Host "`n[!] Auto patch failed: $($_.Exception.Message)" -ForegroundColor Red
+        $exitCode = 1
+    }
+
+    Write-Host "`nPress Enter to close this window..." -ForegroundColor DarkGray
+    $null = Read-Host
+    Exit $exitCode
+} else {
+    Show-Menu
+}
