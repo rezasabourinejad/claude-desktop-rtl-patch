@@ -675,6 +675,50 @@ function Wait-FileUnlock([string]$Path, [int]$TimeoutSeconds = 20) {
     throw "File '$(Split-Path $Path -Leaf)' is still locked after ${TimeoutSeconds}s. A process may still be using it. Try rebooting and running again."
 }
 
+function Get-FileHolders([string]$Path) {
+    # Best-effort: list processes whose loaded modules include the given file.
+    # Used only for diagnostic output on backup failure.
+    try {
+        $procs = Get-Process -ErrorAction SilentlyContinue
+        $holders = @()
+        foreach ($p in $procs) {
+            try {
+                if ($p.Modules | Where-Object { $_.FileName -ieq $Path }) {
+                    $holders += "$($p.Name)($($p.Id))"
+                }
+            } catch { }
+        }
+        return ($holders | Select-Object -Unique)
+    } catch { return @() }
+}
+
+function Copy-FileWithFallback([string]$Source, [string]$Dest) {
+    <#
+    .SYNOPSIS
+        Copies a file, falling back to byte-level read/write if Copy-Item fails
+        with access-denied. Handles cases where the source file is held with
+        share-restrictive locks (e.g., SCM-registered service binaries on
+        Windows Server / sideloaded MSIX packages).
+    #>
+    try {
+        Copy-Item -LiteralPath $Source -Destination $Dest -Force -ErrorAction Stop
+        return
+    } catch {
+        Write-Log "Copy-Item failed for $(Split-Path $Dest -Leaf): $($_.Exception.Message). Trying byte-level fallback..."
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Source)
+        [System.IO.File]::WriteAllBytes($Dest, $bytes)
+        Write-Log "Byte-level copy succeeded for $(Split-Path $Dest -Leaf)"
+    } catch {
+        $holders = Get-FileHolders -Path $Source
+        if ($holders -and $holders.Count -gt 0) {
+            Write-Warn "Processes holding $(Split-Path $Source -Leaf): $($holders -join ', ')"
+        }
+        throw "Failed to back up '$(Split-Path $Source -Leaf)' to '$(Split-Path $Dest -Leaf)': $($_.Exception.Message)"
+    }
+}
+
 function Start-ClaudeServices {
     Write-Step "Restarting Claude background service..."
     $Started = $false
@@ -1031,9 +1075,10 @@ function Install-Patch {
 
     Write-Step "Creating secure backups..."
     Wait-FileUnlock -Path $ExePath -TimeoutSeconds 15
-    if (-not (Test-Path "$AsarPath.bak")) { Copy-Item $AsarPath "$AsarPath.bak" -Force; Write-Success "app.asar.bak created" }
-    if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath)) { Copy-Item $ExePath "$ExePath.bak" -Force; Write-Success "claude.exe.bak created" }
-    if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-Item $CoworkSvcPath "$CoworkSvcPath.bak" -Force; Write-Success "cowork-svc.exe.bak created" }
+    Wait-FileUnlock -Path $CoworkSvcPath -TimeoutSeconds 15
+    if (-not (Test-Path "$AsarPath.bak")) { Copy-FileWithFallback $AsarPath "$AsarPath.bak"; Write-Success "app.asar.bak created" }
+    if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath)) { Copy-FileWithFallback $ExePath "$ExePath.bak"; Write-Success "claude.exe.bak created" }
+    if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-FileWithFallback $CoworkSvcPath "$CoworkSvcPath.bak"; Write-Success "cowork-svc.exe.bak created" }
 
     # Always restore from backup before patching — ensures clean state
     # First run: .bak was just created from same file → copy is a no-op (safe)
