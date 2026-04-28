@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Claude Desktop Smart RTL Patcher & Service Fixer
 .DESCRIPTION
@@ -692,31 +692,120 @@ function Get-FileHolders([string]$Path) {
     } catch { return @() }
 }
 
-function Copy-FileWithFallback([string]$Source, [string]$Dest) {
+function Test-FileValid([string]$Path, [string]$Type) {
     <#
     .SYNOPSIS
-        Copies a file, falling back to byte-level read/write if Copy-Item fails
-        with access-denied. Handles cases where the source file is held with
-        share-restrictive locks (e.g., SCM-registered service binaries on
-        Windows Server / sideloaded MSIX packages).
+        Validates that a file is structurally well-formed for its declared type.
+        Returns $true if valid, $false otherwise. Never throws on a missing or
+        malformed file — callers decide how to react.
+    .PARAMETER Type
+        'asar' — verifies a parsable Electron ASAR header (Compute-AsarHash succeeds).
+        'pe'   — verifies a Windows PE binary: 'MZ' signature and size >= 1 MB.
     #>
+    if (-not (Test-Path $Path)) { return $false }
     try {
-        Copy-Item -LiteralPath $Source -Destination $Dest -Force -ErrorAction Stop
-        return
+        $size = (Get-Item -LiteralPath $Path -ErrorAction Stop).Length
+        if ($size -lt 16) { return $false }
+
+        switch ($Type) {
+            'asar' {
+                # Compute-AsarHash reads the 4-byte JSON-size at offset 12 and the JSON blob.
+                # If the file is truncated or not an ASAR, ReadUInt32/ReadBytes throws.
+                $null = Compute-AsarHash $Path
+                return $true
+            }
+            'pe' {
+                if ($size -lt 1048576) { return $false }
+                $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+                try {
+                    $b0 = $fs.ReadByte()
+                    $b1 = $fs.ReadByte()
+                    return ($b0 -eq 0x4D -and $b1 -eq 0x5A)  # 'M','Z'
+                } finally { $fs.Close() }
+            }
+            default { return ($size -gt 0) }
+        }
+    } catch {
+        return $false
+    }
+}
+
+function Copy-FileSafe([string]$Source, [string]$Dest, [string]$ValidateAs) {
+    <#
+    .SYNOPSIS
+        Atomic file copy with content validation. Writes to "<Dest>.tmp" first,
+        verifies the temp file matches the source byte-for-byte (length + optional
+        type-specific structural check), then renames to <Dest>. If anything fails,
+        the temp is removed and the original <Dest> (if any) is left untouched.
+    .PARAMETER ValidateAs
+        Optional. 'asar' or 'pe'. If supplied, Test-FileValid is also called on the
+        temp file before the rename. Pass empty string or omit to skip type check.
+    .NOTES
+        - Falls back to byte-level read/write if Copy-Item fails (preserves the
+          SCM-locked-binary handling from issue #4).
+        - Source is also validated against ValidateAs before copy: a corrupted
+          source must not become a corrupted backup.
+    #>
+    if (-not (Test-Path -LiteralPath $Source)) {
+        throw "Copy-FileSafe: source '$Source' does not exist."
+    }
+
+    if ($ValidateAs) {
+        if (-not (Test-FileValid -Path $Source -Type $ValidateAs)) {
+            throw "Source file '$(Split-Path $Source -Leaf)' failed integrity check ($ValidateAs). Refusing to create a corrupted backup. Reinstall Claude with: Get-AppxPackage *Claude* | Remove-AppxPackage; then reinstall."
+        }
+    }
+
+    $tmpDest = "$Dest.tmp"
+    if (Test-Path -LiteralPath $tmpDest) {
+        Remove-Item -LiteralPath $tmpDest -Force -ErrorAction SilentlyContinue
+    }
+
+    $copied = $false
+    try {
+        Copy-Item -LiteralPath $Source -Destination $tmpDest -Force -ErrorAction Stop
+        $copied = $true
     } catch {
         Write-Log "Copy-Item failed for $(Split-Path $Dest -Leaf): $($_.Exception.Message). Trying byte-level fallback..."
     }
-    try {
-        $bytes = [System.IO.File]::ReadAllBytes($Source)
-        [System.IO.File]::WriteAllBytes($Dest, $bytes)
-        Write-Log "Byte-level copy succeeded for $(Split-Path $Dest -Leaf)"
-    } catch {
-        $holders = Get-FileHolders -Path $Source
-        if ($holders -and $holders.Count -gt 0) {
-            Write-Warn "Processes holding $(Split-Path $Source -Leaf): $($holders -join ', ')"
+
+    if (-not $copied) {
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($Source)
+            [System.IO.File]::WriteAllBytes($tmpDest, $bytes)
+            Write-Log "Byte-level copy succeeded for $(Split-Path $Dest -Leaf)"
+        } catch {
+            if (Test-Path -LiteralPath $tmpDest) { Remove-Item -LiteralPath $tmpDest -Force -ErrorAction SilentlyContinue }
+            $holders = Get-FileHolders -Path $Source
+            if ($holders -and $holders.Count -gt 0) {
+                Write-Warn "Processes holding $(Split-Path $Source -Leaf): $($holders -join ', ')"
+            }
+            throw "Failed to back up '$(Split-Path $Source -Leaf)' to '$(Split-Path $Dest -Leaf)': $($_.Exception.Message)"
         }
-        throw "Failed to back up '$(Split-Path $Source -Leaf)' to '$(Split-Path $Dest -Leaf)': $($_.Exception.Message)"
     }
+
+    # Verify size matches the source — primary defense against truncated copies
+    # (MSIX bindflt sparse reads, EDR interference, mid-copy interruption).
+    try {
+        $srcLen = (Get-Item -LiteralPath $Source -ErrorAction Stop).Length
+        $tmpLen = (Get-Item -LiteralPath $tmpDest -ErrorAction Stop).Length
+    } catch {
+        if (Test-Path -LiteralPath $tmpDest) { Remove-Item -LiteralPath $tmpDest -Force -ErrorAction SilentlyContinue }
+        throw "Copy-FileSafe: failed to stat copy target: $($_.Exception.Message)"
+    }
+    if ($srcLen -ne $tmpLen) {
+        Remove-Item -LiteralPath $tmpDest -Force -ErrorAction SilentlyContinue
+        throw "Copy-FileSafe: size mismatch for '$(Split-Path $Dest -Leaf)' (source=$srcLen, copy=$tmpLen). Aborting."
+    }
+
+    if ($ValidateAs) {
+        if (-not (Test-FileValid -Path $tmpDest -Type $ValidateAs)) {
+            Remove-Item -LiteralPath $tmpDest -Force -ErrorAction SilentlyContinue
+            throw "Copy-FileSafe: copy of '$(Split-Path $Dest -Leaf)' failed integrity check ($ValidateAs). Aborting."
+        }
+    }
+
+    Move-Item -LiteralPath $tmpDest -Destination $Dest -Force
 }
 
 function Start-ClaudeServices {
@@ -1074,21 +1163,40 @@ function Install-Patch {
     Take-Ownership $ResourcesDir
 
     Write-Step "Creating secure backups..."
+    # Clean up any orphan .bak.tmp files left by a previously interrupted run.
+    foreach ($orphan in @("$AsarPath.bak.tmp", "$ExePath.bak.tmp", "$CoworkSvcPath.bak.tmp")) {
+        if (Test-Path -LiteralPath $orphan) { Remove-Item -LiteralPath $orphan -Force -ErrorAction SilentlyContinue }
+    }
     Wait-FileUnlock -Path $ExePath -TimeoutSeconds 15
     Wait-FileUnlock -Path $CoworkSvcPath -TimeoutSeconds 15
-    if (-not (Test-Path "$AsarPath.bak")) { Copy-FileWithFallback $AsarPath "$AsarPath.bak"; Write-Success "app.asar.bak created" }
-    if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath)) { Copy-FileWithFallback $ExePath "$ExePath.bak"; Write-Success "claude.exe.bak created" }
-    if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-FileWithFallback $CoworkSvcPath "$CoworkSvcPath.bak"; Write-Success "cowork-svc.exe.bak created" }
+    if (-not (Test-Path "$AsarPath.bak"))      { Copy-FileSafe $AsarPath      "$AsarPath.bak"      'asar'; Write-Success "app.asar.bak created" }
+    if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath))             { Copy-FileSafe $ExePath        "$ExePath.bak"        'pe';   Write-Success "claude.exe.bak created" }
+    if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-FileSafe $CoworkSvcPath  "$CoworkSvcPath.bak"  'pe';   Write-Success "cowork-svc.exe.bak created" }
 
     # Always restore from backup before patching — ensures clean state
     # First run: .bak was just created from same file → copy is a no-op (safe)
     # Re-run: restores original files → fresh install on clean files
+    # CRITICAL: validate every backup BEFORE overwriting the live files. If a backup
+    # is corrupt (e.g., truncated leftover from older buggy versions), restoring it
+    # would brick the install — and the rollback path can't recover because it
+    # also reads from .bak.
     Write-Step "Ensuring clean state before patching..."
-    foreach ($pair in @(
-        @{O=$AsarPath;       B="$AsarPath.bak"},
-        @{O=$ExePath;        B="$ExePath.bak"},
-        @{O=$CoworkSvcPath;  B="$CoworkSvcPath.bak"}
-    )) {
+    $RestorePairs = @(
+        @{O=$AsarPath;       B="$AsarPath.bak";       T='asar'},
+        @{O=$ExePath;        B="$ExePath.bak";        T='pe'},
+        @{O=$CoworkSvcPath;  B="$CoworkSvcPath.bak";  T='pe'}
+    )
+    # Pre-flight: verify ALL existing backups are valid before touching anything.
+    # An all-or-nothing check prevents a partial restore that could leave
+    # claude.exe's embedded asar hash mismatching app.asar.
+    foreach ($pair in $RestorePairs) {
+        if ((Test-Path $pair.B) -and -not (Test-FileValid -Path $pair.B -Type $pair.T)) {
+            $bakName = Split-Path $pair.B -Leaf
+            $bakSize = if (Test-Path $pair.B) { (Get-Item -LiteralPath $pair.B).Length } else { 0 }
+            throw "Backup '$bakName' appears corrupted ($bakSize bytes, expected valid $($pair.T)).`n    Path: $($pair.B)`n    Delete the corrupted backup file and re-run, or reinstall Claude:`n      Get-AppxPackage *Claude* | Remove-AppxPackage`n    Aborting before touching any live files."
+        }
+    }
+    foreach ($pair in $RestorePairs) {
         if (Test-Path $pair.B) {
             Wait-FileUnlock -Path $pair.O -TimeoutSeconds 15
             Copy-Item $pair.B $pair.O -Force
@@ -1107,7 +1215,10 @@ function Install-Patch {
         if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
         Write-Log "Extracting ASAR archive (this may take a moment)..."
         cmd.exe /c "npx --yes asar extract `"$AsarPath`" `"$global:TmpDir`""
-        
+        if ($LASTEXITCODE -ne 0) {
+            throw "asar extract failed with exit code $LASTEXITCODE. Aborting before pack would create an empty archive."
+        }
+
         $BuildDir = Join-Path $global:TmpDir ".vite\build"
         if (Test-Path $BuildDir) {
             $JsFiles = Get-ChildItem -Path $BuildDir -Filter "*.js" -Recurse
@@ -1129,7 +1240,15 @@ function Install-Patch {
         $TmpAsarPath = "$AsarPath.new"
         Write-Log "Repacking ASAR archive..."
         cmd.exe /c "npx --yes asar pack `"$global:TmpDir`" `"$TmpAsarPath`""
-        
+        if ($LASTEXITCODE -ne 0) {
+            if (Test-Path -LiteralPath $TmpAsarPath) { Remove-Item -LiteralPath $TmpAsarPath -Force -ErrorAction SilentlyContinue }
+            throw "asar pack failed with exit code $LASTEXITCODE."
+        }
+        if (-not (Test-FileValid -Path $TmpAsarPath -Type 'asar')) {
+            if (Test-Path -LiteralPath $TmpAsarPath) { Remove-Item -LiteralPath $TmpAsarPath -Force -ErrorAction SilentlyContinue }
+            throw "Repacked ASAR archive failed integrity check. Refusing to overwrite app.asar."
+        }
+
         $NewHash = Compute-AsarHash $TmpAsarPath
         Write-Log "New Hash: $NewHash"
         Move-Item -Path $TmpAsarPath -Destination $AsarPath -Force
@@ -1268,12 +1387,40 @@ function Install-Patch {
             # 7. WIPE PRIVATE KEY: public cert stays in Root for verification, but the
             # private key is no longer needed and would let an admin-level attacker
             # sign additional binaries that Windows would auto-trust.
+            #
+            # Note: 'Remove-Item -DeleteKey' is a dynamic parameter of the Cert:
+            # provider that doesn't always bind through a pipeline in PS 5.1, so
+            # we delete the CSP/CNG key material via .NET, then remove the cert
+            # via X509Store — this works on PS 5.1 and PS 7+ uniformly.
+            $myStore = $null
             Try {
-                Get-ChildItem "Cert:\LocalMachine\My\$($Cert.Thumbprint)" -ErrorAction Stop |
-                    Remove-Item -DeleteKey -Force -ErrorAction Stop
-                Write-Success "Private signing key wiped from My store (Root cert retained)"
+                $thumb  = $Cert.Thumbprint
+                $myStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("My", "LocalMachine")
+                $myStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                $found = $myStore.Certificates | Where-Object { $_.Thumbprint -eq $thumb }
+                if ($found) {
+                    if ($found.HasPrivateKey) {
+                        Try {
+                            $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($found)
+                            if ($rsa -is [System.Security.Cryptography.RSACng]) {
+                                $rsa.Key.Delete()
+                            } elseif ($rsa -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
+                                $rsa.PersistKeyInCsp = $false
+                                $rsa.Clear()
+                            }
+                        } Catch {
+                            Write-Warn "Could not delete CSP/CNG key material: $($_.Exception.Message)"
+                        }
+                    }
+                    $myStore.Remove($found)
+                    Write-Success "Private signing key wiped from My store (Root cert retained)"
+                } else {
+                    Write-Warn "Cert with thumbprint $thumb not found in My store; nothing to wipe."
+                }
             } Catch {
                 Write-Warn "Could not delete private key: $($_.Exception.Message)"
+            } Finally {
+                if ($myStore) { $myStore.Close() }
             }
 
         } else {
@@ -1306,8 +1453,11 @@ function Install-Patch {
         Write-Host "    INITIATING AUTOMATIC ROLLBACK TO PREVENT CORRUPTION..." -ForegroundColor Yellow
         
         Restore-Patch -IsRollback
-        
-        throw "Installation failed, but your system was safely restored to its original state."
+
+        # Don't claim a successful restore here — Restore-Patch may have aborted
+        # (e.g., if all backups were corrupt). The rollback path prints its own
+        # final status line, so we just surface the install failure itself.
+        throw "Installation failed. See rollback status above."
     }
 }
 
@@ -1338,24 +1488,71 @@ function Restore-Patch {
 
     Write-Log "Restoring original files from backup..."
     $Restored = $false
-    
+    $Aborted  = $false
+    $SnapshotPaths = @()  # tracked so we can clean them up at the end
+
     $FilesToRestore = @(
-        @{"Orig" = Join-Path $ResourcesDir "app.asar"; "Bak" = Join-Path $ResourcesDir "app.asar.bak"},
-        @{"Orig" = Join-Path $AppDir "claude.exe"; "Bak" = Join-Path $AppDir "claude.exe.bak"},
-        @{"Orig" = Join-Path $ResourcesDir "cowork-svc.exe"; "Bak" = Join-Path $ResourcesDir "cowork-svc.exe.bak"}
+        @{"Orig" = Join-Path $ResourcesDir "app.asar";       "Bak" = Join-Path $ResourcesDir "app.asar.bak";       "Type" = 'asar'},
+        @{"Orig" = Join-Path $AppDir       "claude.exe";     "Bak" = Join-Path $AppDir       "claude.exe.bak";     "Type" = 'pe'},
+        @{"Orig" = Join-Path $ResourcesDir "cowork-svc.exe"; "Bak" = Join-Path $ResourcesDir "cowork-svc.exe.bak"; "Type" = 'pe'}
     )
 
+    # Pre-flight: validate every backup we plan to use. A partial restore where
+    # one file is restored from a good .bak but another fails on a corrupt .bak
+    # would leave claude.exe's embedded asar hash mismatching app.asar — worse
+    # than the patched-but-working state we started from.
+    $InvalidBaks = @()
     foreach ($Item in $FilesToRestore) {
-        if (Test-Path $Item["Bak"]) {
-            Try {
-                Copy-Item $Item["Bak"] $Item["Orig"] -Force -ErrorAction Stop
-                Write-Success "Restored $(Split-Path $Item['Orig'] -Leaf)"
-                $Restored = $true
-            } Catch {
-                Write-Warn "Failed to copy $(Split-Path $Item['Orig'] -Leaf) back: $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $Item["Bak"]) {
+            if (-not (Test-FileValid -Path $Item["Bak"] -Type $Item["Type"])) {
+                $InvalidBaks += (Split-Path $Item["Bak"] -Leaf)
             }
-        } else {
-            Write-Warn "Backup for $(Split-Path $Item['Orig'] -Leaf) not found."
+        }
+    }
+
+    if ($InvalidBaks.Count -gt 0) {
+        Write-Warn "The following backup file(s) appear corrupted and CANNOT be used to restore: $($InvalidBaks -join ', ')"
+        Write-Warn "ROLLBACK ABORTED: leaving the system in its current state to avoid making it worse."
+        Write-Warn "To recover Claude, reinstall the application:"
+        Write-Warn "  Get-AppxPackage *Claude* | Remove-AppxPackage"
+        Write-Warn "Then download and install Claude Desktop again."
+        $Aborted = $true
+    } else {
+        # Snapshot current state so a botched restore can be reversed manually.
+        # Best-effort only: if a snapshot fails, log and proceed.
+        foreach ($Item in $FilesToRestore) {
+            if (Test-Path -LiteralPath $Item["Orig"]) {
+                $snap = "$($Item['Orig']).pre-rollback"
+                Try {
+                    Copy-Item -LiteralPath $Item["Orig"] -Destination $snap -Force -ErrorAction Stop
+                    $SnapshotPaths += $snap
+                } Catch {
+                    Write-Warn "Could not snapshot $(Split-Path $Item['Orig'] -Leaf) before rollback: $($_.Exception.Message)"
+                }
+            }
+        }
+
+        foreach ($Item in $FilesToRestore) {
+            if (Test-Path -LiteralPath $Item["Bak"]) {
+                Try {
+                    Wait-FileUnlock -Path $Item["Orig"] -TimeoutSeconds 15
+                    Copy-Item -LiteralPath $Item["Bak"] -Destination $Item["Orig"] -Force -ErrorAction Stop
+                    Write-Success "Restored $(Split-Path $Item['Orig'] -Leaf)"
+                    $Restored = $true
+                } Catch {
+                    Write-Warn "Failed to copy $(Split-Path $Item['Orig'] -Leaf) back: $($_.Exception.Message)"
+                }
+            } else {
+                Write-Warn "Backup for $(Split-Path $Item['Orig'] -Leaf) not found."
+            }
+        }
+
+        # Clean up the pre-rollback snapshots — the restore worked (we're past the
+        # copies above without throwing), so we no longer need the safety copies.
+        foreach ($snap in $SnapshotPaths) {
+            if (Test-Path -LiteralPath $snap) {
+                Remove-Item -LiteralPath $snap -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
@@ -1371,10 +1568,17 @@ function Restore-Patch {
     Start-ClaudeServices
 
     if ($IsRollback) {
-        Write-Host "`n[V] ROLLBACK COMPLETED SUCCESSFULLY." -ForegroundColor Green
+        if ($Aborted) {
+            Write-Host "`n[X] ROLLBACK ABORTED: backup integrity check failed. System left in its current state - see messages above." -ForegroundColor Red
+        } elseif ($Restored) {
+            Write-Host "`n[V] ROLLBACK COMPLETED SUCCESSFULLY." -ForegroundColor Green
+        } else {
+            Write-Host "`n[!] ROLLBACK FINISHED WITH NO RESTORES (no backups available)." -ForegroundColor Yellow
+        }
     } else {
-        if ($Restored) { Write-Success "Restore process completed. Claude is back to original." }
-        else { Write-Warn "Restore process finished, but no backups were found." }
+        if ($Aborted)   { Write-Warn "Restore aborted - see messages above." }
+        elseif ($Restored) { Write-Success "Restore process completed. Claude is back to original." }
+        else            { Write-Warn "Restore process finished, but no backups were found." }
     }
 }
 
