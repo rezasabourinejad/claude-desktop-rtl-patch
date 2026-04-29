@@ -880,7 +880,7 @@ function Start-ClaudeServices {
 function Take-Ownership($Path) {
     Write-Log "Requesting permissions for: $Path"
     cmd.exe /c "takeown /F `"$Path`" /R /D Y >nul 2>&1"
-    cmd.exe /c "icacls `"$Path`" /grant Administrators:F /T /Q >nul 2>&1"
+    cmd.exe /c "icacls `"$Path`" /grant `"*S-1-5-32-544:(OI)(CI)F`" /T /Q >nul 2>&1"
 }
 
 function Compute-AsarHash($AsarPath) {
