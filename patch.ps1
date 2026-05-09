@@ -248,7 +248,12 @@ $RTL_INJECTION_CODE = @'
                 'pre,.code-block__code,.relative.group\\/copy{unicode-bidi:embed!important;direction:ltr!important;text-align:left!important}',
                 'code{unicode-bidi:isolate!important;direction:ltr!important}',
                 '[dir]{text-align:start!important}[dir="rtl"]{direction:rtl!important}[dir="ltr"]{direction:ltr!important}',
-                '[dir]>*:not([dir]):not(pre):not(code):not(.code-block__code){unicode-bidi:plaintext;text-align:start}'
+                '[dir]>*:not([dir]):not(pre):not(code):not(.code-block__code){unicode-bidi:plaintext;text-align:start}',
+                // RTL: flip sidebar truncation gradient to fade the LEFT edge
+                // (Tailwind classes like [mask-image:linear-gradient(to_right,...)] cut off
+                // the start of Hebrew text instead of the end — see issue #7).
+                '[dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important}',
+                '.group:hover [dir="rtl"][class*="mask-image:linear-gradient(to_right"],.group:focus-within [dir="rtl"][class*="mask-image:linear-gradient(to_right"],[data-menu-open="true"] [dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important}'
             ].join('');
             document.head.appendChild(s);
         }
@@ -504,10 +509,12 @@ $RTL_INJECTION_CODE = @'
                 '<button id="claude-rtl-banner-close" style="background:transparent;color:#aaa;border:0;font-size:20px;cursor:pointer;padding:0 4px" aria-label="close">\u00d7</button>';
             document.body.appendChild(bar);
 
-            document.getElementById('claude-rtl-banner-close').onclick = function() {
+            function dismiss() {
                 localStorage.setItem(FLAG_KEY, VERSION);
                 bar.remove();
-            };
+                document.removeEventListener('click', dismiss, true);
+            }
+            document.addEventListener('click', dismiss, true);
         }
 
         if (document.readyState === 'loading') {
