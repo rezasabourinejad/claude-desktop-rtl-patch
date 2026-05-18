@@ -100,6 +100,73 @@ $RTL_INJECTION_CODE = @'
                 .replace(/`[^`]+`/g, '');
         }
 
+        // --- PER-LINE DIRECTIONAL SPLITTING ---
+        //
+        // A paragraph rendered with <br> separators or whitespace-pre may carry
+        // multiple lines, each in a different script. Forcing a single dir on the
+        // host element mangles every line that disagrees. We instead wrap each
+        // line in its own dir-tagged span and stamp data-rtl-split on the host so
+        // subsequent passes recognize it as already handled.
+
+        var RTL_SPLIT_FLAG = 'data-rtl-split';
+        var BR_OR_NL_SPLIT = /(<br\s*\/?>|\n)/i;
+
+        function hasMultiScriptLines(el) {
+            var src = el.textContent;
+            if (!src) return false;
+            if (!/[a-zA-Z]{2,}/.test(src)) return false;
+            if (!hasRTL(src)) return false;
+            // A break must appear in markup or in the rendered text.
+            return BR_OR_NL_SPLIT.test(el.innerHTML) || src.indexOf('\n') !== -1;
+        }
+
+        function splitToDirectionalSpans(el) {
+            if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
+            // Capturing split: even indices are content, odd indices are the
+            // separator tokens that we want to drop.
+            var segments = el.innerHTML.split(BR_OR_NL_SPLIT);
+            var pieces = [];
+            for (var idx = 0; idx < segments.length; idx += 2) {
+                pieces.push(segments[idx]);
+            }
+            if (pieces.length < 2) return;
+
+            var built = [];
+            for (var p = 0; p < pieces.length; p++) {
+                var chunk = pieces[p];
+                var bare = chunk.replace(/<[^>]+>/g, '').trim();
+                if (bare.length === 0) {
+                    built.push('<span style="display:block;min-height:1em"></span>');
+                    continue;
+                }
+                var pickedDir = detectTextDir(bare);
+                var dirAttr = pickedDir ? ' dir="' + pickedDir + '"' : '';
+                built.push('<span' + dirAttr +
+                           ' style="display:block;text-align:start">' + chunk + '</span>');
+            }
+
+            // Stamp first so an observer callback re-entering during the
+            // innerHTML swap sees us as already processed.
+            el.setAttribute(RTL_SPLIT_FLAG, '1');
+            if (el.hasAttribute('dir')) el.removeAttribute('dir');
+            el.style.direction = '';
+            el.style.textAlign = '';
+            el.innerHTML = built.join('');
+        }
+
+        // Used by the no-RTL branches below: if the element inherits RTL purely
+        // via CSS class on a parent (rather than an explicit dir attribute on
+        // itself), removing dir alone won't free it — we must pin direction=ltr.
+        function resetDirOrPinLTR(el) {
+            if (window.getComputedStyle(el).direction === 'rtl') {
+                el.dir = 'ltr';
+                el.style.direction = 'ltr';
+                return;
+            }
+            if (el.hasAttribute('dir')) el.removeAttribute('dir');
+            el.style.direction = '';
+        }
+
         // --- HYBRID DIRECTION DETECTION ---
 
         // For DOM elements (output): 3-layer detection
@@ -160,9 +227,17 @@ $RTL_INJECTION_CODE = @'
         function processText(root) {
             // Standard text elements
             qsa(root, 'p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary, label, dt, dd').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
+                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.code-block__code') || el.closest('.tiles-shell')) return;
+                if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 var dir = detectElDir(el);
                 if (dir) {
+                    // RTL paragraphs with internal line breaks need per-line
+                    // treatment — otherwise a single English line buried in
+                    // Hebrew text inherits the wrong direction.
+                    if (dir === 'rtl' && hasMultiScriptLines(el)) {
+                        splitToDirectionalSpans(el);
+                        return;
+                    }
                     el.dir = dir;
                     el.style.direction = dir;
                     if (el.tagName === 'LI') {
@@ -177,15 +252,14 @@ $RTL_INJECTION_CODE = @'
                         }
                     }
                 } else {
-                    if (el.hasAttribute('dir')) el.removeAttribute('dir');
-                    el.style.direction = '';
+                    resetDirOrPinLTR(el);
                     if (el.tagName === 'LI') el.style.listStylePosition = '';
                 }
             });
 
             // Lists
             qsa(root, 'ul, ol').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('pre')) return;
+                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.tiles-shell')) return;
                 var dir = detectElDir(el);
                 if (dir === 'rtl') {
                     el.dir = 'rtl';
@@ -193,8 +267,7 @@ $RTL_INJECTION_CODE = @'
                     var pl = getComputedStyle(el).paddingLeft;
                     if (parseFloat(pl) > 0) { el.style.paddingRight = pl; el.style.paddingLeft = '0'; }
                 } else {
-                    if (el.hasAttribute('dir')) el.removeAttribute('dir');
-                    el.style.direction = '';
+                    resetDirOrPinLTR(el);
                     el.style.paddingRight = ''; el.style.paddingLeft = '';
                 }
             });
@@ -203,7 +276,11 @@ $RTL_INJECTION_CODE = @'
         // Universal: process ANY leaf text container (catches dialogs, tooltips, etc.)
         function processContainers(root) {
             qsa(root, 'div, span, button, a, label').forEach(function(el) {
-                if (el.closest('pre') || el.closest('code') || el.closest(WRITING_SEL)) return;
+                if (el.closest('pre') || el.closest('code') || el.closest(WRITING_SEL) || el.closest('.tiles-shell')) return;
+                // Bail if we (or our wrapping host) already converted this subtree into per-line spans.
+                if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
+                var parent = el.parentElement;
+                if (parent && parent.hasAttribute(RTL_SPLIT_FLAG)) return;
                 // Skip if has block children (not a leaf)
                 if (el.querySelector('p, div, ul, ol, h1, h2, h3, h4, h5, h6, pre, table')) return;
                 // Skip elements already handled by processText
@@ -211,8 +288,12 @@ $RTL_INJECTION_CODE = @'
                 var text = (el.textContent || '').trim();
                 if (text.length < 2) return;
                 if (hasRTL(text)) {
-                    el.dir = detectTextDir(text) || 'rtl';
-                    el.style.textAlign = 'start';
+                    if (hasMultiScriptLines(el)) {
+                        splitToDirectionalSpans(el);
+                    } else {
+                        el.dir = detectTextDir(text) || 'rtl';
+                        el.style.textAlign = 'start';
+                    }
                 } else if (el.hasAttribute('dir')) {
                     el.removeAttribute('dir');
                     el.style.textAlign = '';
@@ -253,7 +334,12 @@ $RTL_INJECTION_CODE = @'
                 // (Tailwind classes like [mask-image:linear-gradient(to_right,...)] cut off
                 // the start of Hebrew text instead of the end — see issue #7).
                 '[dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important}',
-                '.group:hover [dir="rtl"][class*="mask-image:linear-gradient(to_right"],.group:focus-within [dir="rtl"][class*="mask-image:linear-gradient(to_right"],[data-menu-open="true"] [dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important}'
+                '.group:hover [dir="rtl"][class*="mask-image:linear-gradient(to_right"],.group:focus-within [dir="rtl"][class*="mask-image:linear-gradient(to_right"],[data-menu-open="true"] [dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important}',
+                // Artifact preview chrome must stay faithful to source: stop the
+                // direction-cascade from any [dir="rtl"] ancestor at .tiles-shell.
+                // Descendants inherit LTR from here, but source-supplied [dir="rtl"]
+                // inside the preview still wins via the rule above.
+                '.tiles-shell{direction:ltr!important;unicode-bidi:isolate!important}'
             ].join('');
             document.head.appendChild(s);
         }
@@ -528,10 +614,27 @@ $RTL_INJECTION_CODE = @'
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
-function Write-Log($msg)     { Write-Host "  [*] $msg" -ForegroundColor Cyan }
-function Write-Step($msg)    { Write-Host "`n► $msg" -ForegroundColor Magenta }
-function Write-Success($msg) { Write-Host "  [+] $msg" -ForegroundColor Green }
-function Write-Warn($msg)    { Write-Host "  [!] $msg" -ForegroundColor Yellow }
+# Persistent log -- captures every patch run (including silent ones triggered by
+# the auto-update watcher) so failures can be diagnosed after the fact.
+$global:PatchLogFile = Join-Path $env:ProgramData "ClaudeRtlPatch\patch.log"
+
+function Write-LogToFile($level, $msg) {
+    try {
+        $dir = Split-Path -Parent $global:PatchLogFile
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        # Rotate at 1 MB to keep the file readable. One generation of history is enough.
+        if ((Test-Path $global:PatchLogFile) -and (Get-Item $global:PatchLogFile).Length -gt 1MB) {
+            Move-Item $global:PatchLogFile "$global:PatchLogFile.old" -Force
+        }
+        "$([DateTime]::Now.ToString('o'))  [$level] $msg" |
+            Out-File -Append -FilePath $global:PatchLogFile -Encoding UTF8
+    } catch {}
+}
+
+function Write-Log($msg)     { Write-Host "  [*] $msg" -ForegroundColor Cyan;    Write-LogToFile 'INFO' $msg }
+function Write-Step($msg)    { Write-Host "`n► $msg" -ForegroundColor Magenta;   Write-LogToFile 'STEP' $msg }
+function Write-Success($msg) { Write-Host "  [+] $msg" -ForegroundColor Green;   Write-LogToFile 'OK'   $msg }
+function Write-Warn($msg)    { Write-Host "  [!] $msg" -ForegroundColor Yellow;  Write-LogToFile 'WARN' $msg }
 
 # Pure Binary Search equivalent to Python's bytearray.find()
 function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0) {
@@ -907,6 +1010,81 @@ function Compute-AsarHash($AsarPath) {
     $hashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonStr))
     $hashStr = [BitConverter]::ToString($hashBytes).Replace("-", "").ToLower()
     return $hashStr
+}
+
+# -----------------------------------------------------------------------------
+# Alternative bypass path used when the byte-level hash replacement can't locate
+# the asar hash inside claude.exe (e.g. hash encoding, algorithm or storage
+# location changed upstream). Decomposed into a probe + a predicate + the main
+# entry so each piece is testable in isolation. We never throw from here — the
+# caller chooses what to do with a $false return.
+# -----------------------------------------------------------------------------
+
+# Pattern matched against `@electron/fuses read` output to detect the disabled state.
+$script:AsarFuseDisabledPattern = 'EnableEmbeddedAsarIntegrityValidation[^\r\n]*Disabled'
+
+function Get-FuseProbeOutput {
+    param([Parameter(Mandatory)][string]$ExePath)
+    $raw = cmd.exe /c "npx --yes @electron/fuses read --app `"$ExePath`" 2>&1"
+    return ($raw | Out-String)
+}
+
+function Test-AsarIntegrityFuseDisabled {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ProbeOutput)
+    return [bool]($ProbeOutput -match $script:AsarFuseDisabledPattern)
+}
+
+function Set-AsarIntegrityFuseOff {
+    param([Parameter(Mandatory)][string]$ExePath)
+    $raw = cmd.exe /c "npx --yes @electron/fuses write --app `"$ExePath`" EnableEmbeddedAsarIntegrityValidation=off 2>&1"
+    return [pscustomobject]@{ Output = ($raw | Out-String); ExitCode = $LASTEXITCODE }
+}
+
+function Invoke-FuseFlip {
+    param([Parameter(Mandatory)][string]$ExePath)
+
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        Write-Warn "Invoke-FuseFlip: target not found at $ExePath"
+        return $false
+    }
+
+    $prevWarn = $env:NODE_NO_WARNINGS
+    $env:NODE_NO_WARNINGS = '1'
+    try {
+        Write-Log "Probing Electron fuse state on $(Split-Path $ExePath -Leaf)..."
+        $before = Get-FuseProbeOutput -ExePath $ExePath
+        if (Test-AsarIntegrityFuseDisabled -ProbeOutput $before) {
+            Write-Success "ASAR integrity fuse already off — nothing to do."
+            return $true
+        }
+
+        Write-Log "Disabling ASAR integrity fuse (EnableEmbeddedAsarIntegrityValidation=off)..."
+        $write = Set-AsarIntegrityFuseOff -ExePath $ExePath
+        if ($write.ExitCode -ne 0) {
+            Write-Warn "Fuse write returned non-zero exit ($($write.ExitCode))."
+            foreach ($line in $write.Output.Split("`n")) {
+                $trimmed = $line.TrimEnd()
+                if ($trimmed) { Write-Log "    $trimmed" }
+            }
+            return $false
+        }
+
+        # Re-probe — some tool builds print "Fuses written" without actually persisting.
+        $after = Get-FuseProbeOutput -ExePath $ExePath
+        if (Test-AsarIntegrityFuseDisabled -ProbeOutput $after) {
+            Write-Success "Fuse disabled and confirmed via re-probe."
+            return $true
+        }
+        Write-Warn "Fuse write reported success but re-probe still shows Enabled."
+        return $false
+    }
+    catch {
+        Write-Warn "Invoke-FuseFlip threw: $($_.Exception.Message)"
+        return $false
+    }
+    finally {
+        $env:NODE_NO_WARNINGS = $prevWarn
+    }
 }
 
 function Create-UpdateShortcut {
@@ -1365,7 +1543,14 @@ function Install-Patch {
                 [System.IO.File]::WriteAllBytes($ExePath, $ExeBytes)
                 Write-Success "Replaced $Replacements ASAR hash(es) in claude.exe"
             } else {
-                Write-Warn "Old hash not found in claude.exe. Skipping hash replacement."
+                # Byte search came up empty — the hash format upstream may have
+                # shifted. Fall through to the fuse-based bypass; the subsequent
+                # re-sign block restores a valid Authenticode signature either way.
+                Write-Warn "Old hash not found in claude.exe — falling back to fuse-based bypass."
+                if (-not (Invoke-FuseFlip -ExePath $ExePath)) {
+                    throw "Both byte-search and fuse-based bypass failed. Aborting before re-sign."
+                }
+                Write-Success "ASAR integrity bypassed via Electron fuse."
             }
 
             Write-Log "Re-signing claude.exe with self-signed certificate (this can take several seconds)..."
