@@ -227,7 +227,7 @@ $RTL_INJECTION_CODE = @'
         function processText(root) {
             // Standard text elements
             qsa(root, 'p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary, label, dt, dd').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.code-block__code') || el.closest('.tiles-shell:not(:has(.epitaxy-markdown))')) return;
+                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 var dir = detectElDir(el);
                 if (dir) {
@@ -259,7 +259,7 @@ $RTL_INJECTION_CODE = @'
 
             // Lists
             qsa(root, 'ul, ol').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.tiles-shell:not(:has(.epitaxy-markdown))')) return;
+                if (el.closest(WRITING_SEL) || el.closest('pre')) return;
                 var dir = detectElDir(el);
                 if (dir === 'rtl') {
                     el.dir = 'rtl';
@@ -276,7 +276,7 @@ $RTL_INJECTION_CODE = @'
         // Universal: process ANY leaf text container (catches dialogs, tooltips, etc.)
         function processContainers(root) {
             qsa(root, 'div, span, button, a, label').forEach(function(el) {
-                if (el.closest('pre') || el.closest('code') || el.closest(WRITING_SEL) || el.closest('.tiles-shell:not(:has(.epitaxy-markdown))')) return;
+                if (el.closest('pre') || el.closest('code') || el.closest(WRITING_SEL)) return;
                 // Bail if we (or our wrapping host) already converted this subtree into per-line spans.
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 var parent = el.parentElement;
@@ -334,12 +334,7 @@ $RTL_INJECTION_CODE = @'
                 // (Tailwind classes like [mask-image:linear-gradient(to_right,...)] cut off
                 // the start of Hebrew text instead of the end — see issue #7).
                 '[dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important}',
-                '.group:hover [dir="rtl"][class*="mask-image:linear-gradient(to_right"],.group:focus-within [dir="rtl"][class*="mask-image:linear-gradient(to_right"],[data-menu-open="true"] [dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important}',
-                // Artifact preview chrome must stay faithful to source: stop the
-                // direction-cascade from any [dir="rtl"] ancestor at .tiles-shell.
-                // Descendants inherit LTR from here, but source-supplied [dir="rtl"]
-                // inside the preview still wins via the rule above.
-                '.tiles-shell:not(:has(.epitaxy-markdown)){direction:ltr!important;unicode-bidi:isolate!important}'
+                '.group:hover [dir="rtl"][class*="mask-image:linear-gradient(to_right"],.group:focus-within [dir="rtl"][class*="mask-image:linear-gradient(to_right"],[data-menu-open="true"] [dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important}'
             ].join('');
             document.head.appendChild(s);
         }
