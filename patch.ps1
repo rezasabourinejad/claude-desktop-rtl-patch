@@ -20,10 +20,26 @@ if (-not $Auto -and $env:CLAUDE_RTL_AUTO -eq '1') { $Auto = $true }
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
-    # Route elevation through install.ps1 so every run uses the same signature-verified
-    # path. Re-downloading patch.ps1 here would bypass the RSA check in install.ps1 and
-    # reopen the supply-chain hole (C1). install.ps1 fetches + verifies + Start-Process
-    # -Verb RunAs for the actual elevation. Auto mode propagates via env var.
+    # Prefer the locally-installed verified-update helper if it exists. That
+    # helper (written admin-only at install time, see Save-UpdateScript) uses
+    # the pinned pubkey to verify patch.ps1 before elevation -- hermetic
+    # against a compromised GitHub repo. install.ps1 is unsigned, so falling
+    # back to it is acceptable ONLY for first-time bootstrap where no local
+    # trust anchor exists yet.
+    $LocalUpdate = Join-Path $env:ProgramData "ClaudeRtlPatch\update.ps1"
+    if (Test-Path $LocalUpdate) {
+        if ($Auto) { $env:CLAUDE_RTL_AUTO = '1' }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $LocalUpdate
+        Exit
+    }
+    # First-install bootstrap: no local pin yet. TOFU on install.ps1 -- the
+    # same exposure the user already accepts when running `irm install.ps1 | iex`.
+    # PS 5.1 defaults to TLS 1.0; GitHub requires 1.2+ -- enable it before the
+    # IRM call below or the fallback fails with an opaque connection error.
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
     $InstallUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1"
     if ($Auto) { $env:CLAUDE_RTL_AUTO = '1' }
     Invoke-Expression (Invoke-RestMethod $InstallUrl)
@@ -676,38 +692,217 @@ function Save-PatchState {
 }
 
 function Save-TrustedPubkey {
-    # Pins the SHA-256 of install.ps1's embedded public key to disk. The
-    # auto-update watcher reads this file before every run and refuses to
-    # invoke install.ps1 if the pinned fingerprint no longer matches what the
-    # current install.ps1 ships. This is what makes full-repo-takeover
-    # ineffective against existing installs: the attacker can swap pubkeys in
-    # install.ps1 all they want, but the watcher's trust anchor was captured
-    # at install time and is stored locally beyond their reach.
+    # Pins the maintainer's PUBLIC KEY (the full RSA blob, not just a fingerprint
+    # of it) to disk. The auto-update watcher loads this key directly and uses it
+    # to verify patch.ps1.sig itself — install.ps1 is never fetched or executed
+    # during auto-update. Storing the full key (instead of SHA-256 over the
+    # blob, as the V1 design did) closes two bypasses of the V1 scheme:
+    #   1. install.ps1 is unsigned. A V1 watcher fingerprint-matched only the
+    #      $ExpectedPubKey variable, then ran the rest of install.ps1 as admin.
+    #      A compromised repo could leave the pubkey untouched and ship a
+    #      malicious payload around it. V2 never executes install.ps1.
+    #   2. Regex extraction of $ExpectedPubKey is not equivalent to PowerShell's
+    #      parser (commented-out lines, multiple assignments, here-strings).
+    #      V2 reads the pubkey bytes from a local file, no parsing of remote
+    #      script content involved.
     #
     # The pubkey value arrives via the CLAUDE_RTL_TRUSTED_PUBKEY env var set by
-    # install.ps1. Using the env var (not a fresh download) avoids a TOCTOU
-    # race where the repo could change between install.ps1's verification and
-    # patch.ps1's pinning step.
+    # install.ps1 (first install) or by the watcher itself (subsequent
+    # re-registrations). Using the env var rather than a fresh download avoids
+    # a TOCTOU race where the repo could change between verification and pin.
     try {
         $pubB64 = $env:CLAUDE_RTL_TRUSTED_PUBKEY
         if (-not $pubB64) {
-            Write-Warn "No CLAUDE_RTL_TRUSTED_PUBKEY env var; trusted-pubkey.fpr will not be written."
+            Write-Warn "No CLAUDE_RTL_TRUSTED_PUBKEY env var; trusted-pubkey.b64 will not be written."
             Write-Warn "(Auto-update watcher will refuse to run without it -- this is the safe default.)"
             return
         }
-        $pubBytes = [Convert]::FromBase64String($pubB64)
-        $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($pubBytes)
-        $fp = ([BitConverter]::ToString($sha)).Replace('-', '').ToLower()
+
+        # Validate the blob is well-formed before pinning. A corrupt or
+        # truncated env var would poison the pin and break legitimate updates.
+        try {
+            $pubJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($pubB64))
+            $pubObj  = $pubJson | ConvertFrom-Json
+            $null = [Convert]::FromBase64String($pubObj.Modulus)
+            $null = [Convert]::FromBase64String($pubObj.Exponent)
+        } catch {
+            Write-Warn "Trusted pubkey from env var failed to parse ($($_.Exception.Message)). Refusing to pin."
+            return
+        }
 
         if (-not (Test-Path $global:RtlStateDir)) {
             New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
         }
-        $fpPath = Join-Path $global:RtlStateDir 'trusted-pubkey.fpr'
+        $pinPath = Join-Path $global:RtlStateDir 'trusted-pubkey.b64'
         $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-        [IO.File]::WriteAllText($fpPath, $fp, $utf8NoBom)
-        Write-Log "Trusted pubkey fingerprint pinned: $fp"
+        [IO.File]::WriteAllText($pinPath, $pubB64, $utf8NoBom)
+
+        # Log a fingerprint so operators can cross-check against install.ps1 /
+        # the README without exposing the full key blob in the log.
+        $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([Convert]::FromBase64String($pubB64))
+        $fp  = ([BitConverter]::ToString($sha)).Replace('-', '').ToLower()
+        Write-Log "Trusted pubkey pinned at $pinPath (sha256=$fp)"
+
+        # Clean up the V1 fingerprint-only file. Harmless leftover but the V2
+        # watcher no longer reads it; removing it avoids confusing future audits.
+        $legacyFpr = Join-Path $global:RtlStateDir 'trusted-pubkey.fpr'
+        if (Test-Path $legacyFpr) {
+            Remove-Item $legacyFpr -Force -ErrorAction SilentlyContinue
+            Write-Log "Removed legacy V1 pin file: trusted-pubkey.fpr"
+        }
     } catch {
         Write-Warn "Save-TrustedPubkey failed: $($_.Exception.Message)"
+    }
+}
+
+function Save-UpdateScript {
+    # Writes a small local helper to %ProgramData%\ClaudeRtlPatch\update.ps1
+    # used by the desktop "Update Claude RTL" shortcut. The helper does the
+    # SAME verify-then-run dance the auto-update watcher does:
+    #   1. Loads the pinned pubkey from trusted-pubkey.b64.
+    #   2. Downloads patch.ps1 + patch.ps1.sig from GitHub.
+    #   3. Verifies the RSA signature with the pinned key.
+    #   4. Elevates via UAC and runs patch.ps1 -Auto directly.
+    #
+    # The whole point is to keep manual updates off the install.ps1 codepath.
+    # install.ps1 itself is unsigned, so a compromised repo could ship a
+    # malicious install.ps1 that runs as admin once the user clicks the
+    # shortcut (UAC notwithstanding -- the user expects an update prompt and
+    # would consent). With this helper, the shortcut launches LOCAL code only;
+    # the only network artifact we trust is patch.ps1 + its signature.
+    #
+    # The helper is written as admin (this function only runs from Install-Patch
+    # or Install-AutoUpdateTask, both elevated), so non-admin users cannot
+    # tamper with it later -- the file inherits ProgramData ACLs where files
+    # are owned by their elevated creator.
+    try {
+        if (-not (Test-Path $global:RtlStateDir)) {
+            New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
+        }
+        $updatePath = Join-Path $global:RtlStateDir 'update.ps1'
+
+        # Single-quoted here-string: $ signs are preserved literally for runtime evaluation.
+        $updateBody = @'
+# Claude RTL Patch -- verified local updater.
+#
+# Loaded by the desktop "Update Claude RTL" shortcut. Uses the pubkey pinned
+# at install time to verify patch.ps1 against the maintainer's offline private
+# key, then elevates via UAC. install.ps1 is intentionally NOT used here --
+# a compromised GitHub repo cannot influence this path.
+$ErrorActionPreference = "Continue"
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
+
+$stateDir      = Join-Path $env:ProgramData "ClaudeRtlPatch"
+$pubkeyPinFile = Join-Path $stateDir "trusted-pubkey.b64"
+$repoBase      = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main"
+$patchUrl      = "$repoBase/patch.ps1"
+$sigUrl        = "$repoBase/patch.ps1.sig"
+
+function Pause-ThenExit($code) {
+    Write-Host ""
+    Write-Host "Press Enter to close this window..." -ForegroundColor DarkGray
+    $null = Read-Host
+    Exit $code
+}
+
+Write-Host ""
+Write-Host "=======================================================" -ForegroundColor Cyan
+Write-Host "  Claude RTL Patch -- verified update                  " -ForegroundColor Cyan
+Write-Host "=======================================================" -ForegroundColor Cyan
+Write-Host ""
+
+if (-not (Test-Path $pubkeyPinFile)) {
+    Write-Host "No pinned pubkey at $pubkeyPinFile." -ForegroundColor Red
+    Write-Host "This computer has not bootstrapped a trust anchor yet." -ForegroundColor Yellow
+    Write-Host "Run the manual installer once to fix this:" -ForegroundColor Yellow
+    Write-Host "  irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1 | iex" -ForegroundColor Cyan
+    Pause-ThenExit 1
+}
+
+try {
+    $pubB64 = (Get-Content $pubkeyPinFile -Raw).Trim()
+    if (-not $pubB64) { throw "Pinned pubkey file is empty." }
+    $pubJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($pubB64))
+    $pubObj  = $pubJson | ConvertFrom-Json
+    $params = New-Object System.Security.Cryptography.RSAParameters
+    $params.Modulus  = [Convert]::FromBase64String($pubObj.Modulus)
+    $params.Exponent = [Convert]::FromBase64String($pubObj.Exponent)
+    $rsa = [System.Security.Cryptography.RSA]::Create()
+    $rsa.ImportParameters($params)
+} catch {
+    Write-Host "Pinned pubkey is unreadable: $($_.Exception.Message)" -ForegroundColor Red
+    Pause-ThenExit 1
+}
+
+Write-Host "Downloading patch.ps1 + signature..." -ForegroundColor Gray
+try {
+    $wc = New-Object System.Net.WebClient
+    $patchBytes = $wc.DownloadData($patchUrl)
+    $sigB64     = $wc.DownloadString($sigUrl).Trim()
+} catch {
+    Write-Host "Network error: $($_.Exception.Message)" -ForegroundColor Red
+    Pause-ThenExit 1
+}
+
+try {
+    $sigBytes = [Convert]::FromBase64String($sigB64)
+} catch {
+    Write-Host "Downloaded signature is not valid base64. Aborting." -ForegroundColor Red
+    Pause-ThenExit 1
+}
+
+$valid = $rsa.VerifyData($patchBytes, $sigBytes,
+    [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+    [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+
+if (-not $valid) {
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Red
+    Write-Host "  SIGNATURE VERIFICATION FAILED -- REFUSING TO RUN patch.ps1     " -ForegroundColor Red
+    Write-Host "================================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "patch.ps1 does not match the pinned maintainer key." -ForegroundColor Yellow
+    Write-Host "Possible causes:" -ForegroundColor Yellow
+    Write-Host "  * The GitHub repository was compromised." -ForegroundColor Yellow
+    Write-Host "  * The maintainer rotated keys (requires a manual re-install)." -ForegroundColor Yellow
+    Write-Host "  * A proxy is intercepting traffic." -ForegroundColor Yellow
+    Pause-ThenExit 1
+}
+
+# Strip incoming BOM (we re-add UTF-8 BOM on write). PS 5.1 needs BOM to parse
+# Hebrew/box-drawing characters in patch.ps1.
+$tmpFile = Join-Path $env:TEMP "claude_rtl_patch.ps1"
+$content = [System.Text.Encoding]::UTF8.GetString($patchBytes)
+if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $content.Substring(1) }
+[System.IO.File]::WriteAllText($tmpFile, $content, [System.Text.UTF8Encoding]::new($true))
+
+Write-Host "Patch verified ($($patchBytes.Length) bytes). Elevating..." -ForegroundColor Green
+
+# Propagate the pinned pubkey so the elevated child's Save-TrustedPubkey (if
+# it runs during a watcher re-registration) sees the SAME trust anchor.
+# CLAUDE_RTL_AUTO=1 tells patch.ps1 to run Install-Patch directly instead of
+# showing the menu -- matching the documented "1-click update" behavior.
+$env:CLAUDE_RTL_TRUSTED_PUBKEY = $pubB64
+$env:CLAUDE_RTL_AUTO = '1'
+
+# Elevate via UAC. patch.ps1's Auto mode pauses on Read-Host at the end, so
+# the user gets a chance to read the patch log before the window closes.
+Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -Verb RunAs `
+    -ArgumentList @(
+        '-NoProfile','-ExecutionPolicy','Bypass',
+        '-File',$tmpFile,'-Auto'
+    )
+'@
+
+        # PS 5.1 needs UTF-8 with BOM to parse Unicode text correctly.
+        [System.IO.File]::WriteAllText($updatePath, $updateBody, [System.Text.UTF8Encoding]::new($true))
+        Write-Log "Verified-update helper written to $updatePath"
+    } catch {
+        Write-Warn "Save-UpdateScript failed: $($_.Exception.Message)"
     }
 }
 
@@ -1105,28 +1300,33 @@ function Invoke-FuseFlip {
 function Create-UpdateShortcut {
     Write-Step "Creating Quick Update Shortcut..."
     Try {
+        # Ensure the verified-update helper exists locally before pointing the
+        # shortcut at it. Save-UpdateScript is idempotent.
+        Save-UpdateScript
+
         $WshShell = New-Object -comObject WScript.Shell
-        # הגדרת המיקום לשולחן העבודה
         $DesktopPath = [Environment]::GetFolderPath('Desktop')
         $ShortcutPath = Join-Path $DesktopPath "Update Claude RTL.lnk"
-        
+        $LocalUpdatePath = Join-Path $global:RtlStateDir 'update.ps1'
+
         $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
         $Shortcut.TargetPath = "powershell.exe"
-        
-        # הפקודה המדויקת שמושכת את ההתקנה העדכנית מהרשת ללא שמירת קובץ מקומי
-        $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1 | iex`""
-        $Shortcut.Description = "Download and apply the latest Claude Desktop RTL patch"
-        
-        # ניסיון להשתמש באייקון של קלוד כדי שייראה יפה, אם לא - אייקון ברירת מחדל של PowerShell
+        # Point at the LOCAL verified-update helper, not at remote install.ps1.
+        # The helper uses the pinned pubkey to verify patch.ps1 before elevating;
+        # a hijacked GitHub install.ps1 cannot influence this path.
+        $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalUpdatePath`""
+        $Shortcut.Description = "Verified update of the Claude Desktop RTL patch"
+
         $ClaudeDir = Find-ClaudeDir
         if ($ClaudeDir -and (Test-Path (Join-Path $ClaudeDir "app\claude.exe"))) {
             $Shortcut.IconLocation = "$(Join-Path $ClaudeDir "app\claude.exe"),0"
         } else {
             $Shortcut.IconLocation = "powershell.exe,0"
         }
-        
+
         $Shortcut.Save()
         Write-Success "Shortcut created successfully on your Desktop: $ShortcutPath"
+        Write-Success "It launches the local verified-update helper: $LocalUpdatePath"
     } Catch {
         Write-Warn "Failed to create shortcut: $($_.Exception.Message)"
     }
@@ -1156,7 +1356,7 @@ function Install-AutoUpdateTask {
     $watcher = @'
 $ErrorActionPreference = "Continue"
 # Scheduled Task PowerShell defaults to TLS 1.0, which GitHub rejects. Force 1.2
-# so Test-TrustedPubkey's WebClient call to raw.githubusercontent.com succeeds.
+# so WebClient calls to raw.githubusercontent.com succeed.
 try {
     [Net.ServicePointManager]::SecurityProtocol =
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -1165,10 +1365,17 @@ $stateDir       = Join-Path $env:ProgramData "ClaudeRtlPatch"
 $stateFile      = Join-Path $stateDir "state.json"
 $logFile        = Join-Path $stateDir "watcher.log"
 $lastActionFile = Join-Path $stateDir "last-action.txt"
-$pubkeyPinFile  = Join-Path $stateDir "trusted-pubkey.fpr"
-# Use install.ps1 -- same path as the manual "Update Claude RTL" desktop shortcut.
-# install.ps1 handles BOM-encoding and elevation; we just signal Auto mode via env var.
-$installUrl     = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1"
+$pubkeyPinFile  = Join-Path $stateDir "trusted-pubkey.b64"
+# The watcher fetches patch.ps1 + patch.ps1.sig DIRECTLY and verifies them with
+# the locally-pinned pubkey. install.ps1 is intentionally NOT used here: it is
+# unsigned, and any compromised version of install.ps1 served from a hijacked
+# repo would otherwise execute as admin during auto-update. Pinning the full
+# pubkey (not a fingerprint of install.ps1's $ExpectedPubKey variable) means
+# the only thing we trust from the network is patch.ps1 itself, validated
+# byte-for-byte against the maintainer's offline private key.
+$repoBase       = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main"
+$patchUrl       = "$repoBase/patch.ps1"
+$sigUrl         = "$repoBase/patch.ps1.sig"
 
 function Write-WLog($msg) {
     try {
@@ -1218,40 +1425,33 @@ function Get-PatchedVer {
     return $null
 }
 
-function Test-TrustedPubkey {
-    # The watcher's local trust anchor. Compares the SHA-256 of install.ps1's
-    # currently-embedded $ExpectedPubKey against the fingerprint stored on disk
-    # at install time. Mismatch = the GitHub repo published a different pubkey
-    # than the one the user pinned -- could be a legit key rotation by the
-    # maintainer (manual re-install required) or a compromised repository.
-    # Either way we refuse to run automatically.
+function Get-PinnedRsa {
+    # Loads the pinned public key from disk and returns an RSA object configured
+    # with the maintainer's pubkey, plus the original base64 blob (so callers
+    # can forward it via env var to any child process without re-encoding).
+    # The watcher uses this RSA object directly to verify patch.ps1.sig --
+    # install.ps1 is never consulted, never executed during auto-update.
     try {
         if (-not (Test-Path $pubkeyPinFile)) {
             Write-WLog "No pinned pubkey at $pubkeyPinFile -- refusing to auto-update."
-            return $false
+            return $null
         }
-        $expected = (Get-Content $pubkeyPinFile -Raw).Trim().ToLower()
-        if (-not $expected) {
+        $pubB64 = (Get-Content $pubkeyPinFile -Raw).Trim()
+        if (-not $pubB64) {
             Write-WLog "Pinned pubkey file is empty -- refusing to auto-update."
-            return $false
+            return $null
         }
-        $content = (New-Object System.Net.WebClient).DownloadString($installUrl)
-        if ($content -notmatch "ExpectedPubKey\s*=\s*'([A-Za-z0-9+/=]+)'") {
-            Write-WLog "Could not extract ExpectedPubKey from remote install.ps1 -- treating as untrusted."
-            return $false
-        }
-        $bytes = [Convert]::FromBase64String($matches[1])
-        $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
-        $actual = ([BitConverter]::ToString($sha)).Replace('-', '').ToLower()
-        if ($expected -ne $actual) {
-            Write-WLog "PUBKEY FINGERPRINT MISMATCH! pinned=$expected actual=$actual"
-            return $false
-        }
-        Write-WLog "Pinned pubkey verified ($actual)"
-        return $true
+        $pubJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($pubB64))
+        $pubObj  = $pubJson | ConvertFrom-Json
+        $params = New-Object System.Security.Cryptography.RSAParameters
+        $params.Modulus  = [Convert]::FromBase64String($pubObj.Modulus)
+        $params.Exponent = [Convert]::FromBase64String($pubObj.Exponent)
+        $rsa = [System.Security.Cryptography.RSA]::Create()
+        $rsa.ImportParameters($params)
+        return @{ Rsa = $rsa; PubB64 = $pubB64 }
     } catch {
-        Write-WLog "Test-TrustedPubkey error: $($_.Exception.Message)"
-        return $false
+        Write-WLog "Get-PinnedRsa error: $($_.Exception.Message)"
+        return $null
     }
 }
 
@@ -1268,36 +1468,84 @@ function Invoke-AutoPatch($newVer, $exePath) {
     }
     (Get-Date).ToString('o') | Set-Content $lastActionFile -Encoding UTF8
 
-    Write-WLog "Detected Claude v$newVer at $exePath -- checking pinned pubkey before launching installer..."
-    if (-not (Test-TrustedPubkey)) {
-        Show-Toast "Claude RTL: auto-update BLOCKED" "The maintainer's pubkey on GitHub no longer matches the one you pinned. If you trust this change, re-install manually. Until then, the patch will not auto-update."
-        Write-WLog "Auto-update aborted: pinned pubkey check failed."
+    Write-WLog "Detected Claude v$newVer at $exePath -- verifying signature before patching..."
+
+    $pinned = Get-PinnedRsa
+    if (-not $pinned) {
+        Show-Toast "Claude RTL: auto-update BLOCKED" "Trusted pubkey pin is missing or unreadable. Re-install the patch manually to restore auto-updates."
         return
     }
-    Write-WLog "Pinned pubkey OK -- launching install.ps1 (Auto mode)"
+
+    # Fetch patch.ps1 + signature directly as raw bytes. The signature is over
+    # the exact LF-normalized bytes the maintainer signed; raw.githubusercontent.com
+    # serves LF (.gitattributes eol=lf), so the on-wire bytes match. Do NOT
+    # decode to string before verifying -- string round-trips can alter BOMs.
+    try {
+        $wc = New-Object System.Net.WebClient
+        $patchBytes = $wc.DownloadData($patchUrl)
+        $sigB64     = $wc.DownloadString($sigUrl).Trim()
+    } catch {
+        Write-WLog "Download failed: $($_.Exception.Message)"
+        Show-Toast "Claude RTL: auto-update failed" "Network error downloading patch. Will retry next launch."
+        return
+    }
+
+    try {
+        $sigBytes = [Convert]::FromBase64String($sigB64)
+    } catch {
+        Write-WLog "Signature is not valid base64: $($_.Exception.Message)"
+        Show-Toast "Claude RTL: auto-update BLOCKED" "Downloaded signature is malformed. Will not run patch."
+        return
+    }
+
+    $valid = $pinned.Rsa.VerifyData(
+        $patchBytes, $sigBytes,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+
+    if (-not $valid) {
+        Write-WLog "SIGNATURE MISMATCH on patch.ps1 -- refusing to auto-update."
+        Show-Toast "Claude RTL: auto-update BLOCKED" "patch.ps1 does not match the pinned maintainer key. The repo may have been compromised. Re-install manually only after verifying the source out-of-band."
+        return
+    }
+
+    Write-WLog "Signature verified ($($patchBytes.Length) bytes). Writing temp file and launching patch.ps1..."
+
+    # Write patch.ps1 to disk with a UTF-8 BOM (PS 5.1 needs the BOM to parse
+    # Hebrew/box-drawing characters correctly). Strip any incoming BOM from the
+    # bytes first to avoid double-BOM.
+    $tmpFile = Join-Path $env:TEMP 'claude_rtl_patch.ps1'
+    $content = [System.Text.Encoding]::UTF8.GetString($patchBytes)
+    if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $content.Substring(1) }
+    [System.IO.File]::WriteAllText($tmpFile, $content, [System.Text.UTF8Encoding]::new($true))
+
     Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
 
-    # Kill running Claude processes for snappy UX (patch.ps1 will kill again properly via Stop-ClaudeServices).
+    # Kill running Claude processes for snappy UX (patch.ps1 will kill again via Stop-ClaudeServices).
     Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
     try {
-        # Use the EXACT same command as the manual "Update Claude RTL" desktop shortcut.
-        # install.ps1 downloads patch.ps1 with UTF-8 BOM and re-launches it elevated.
-        # The CLAUDE_RTL_AUTO env var propagates through the chain and patch.ps1 picks it up
-        # via its env-var fallback (skipping the menu and running Install-Patch directly).
+        # Propagate the pinned pubkey to the child so any re-registration that
+        # happens inside patch.ps1 (Save-TrustedPubkey) sees the SAME trust
+        # anchor -- never downgraded to "whatever's currently in install.ps1
+        # on GitHub". The watcher is already elevated (RunLevel Highest), so
+        # the spawned PowerShell inherits the elevated token without a UAC prompt.
+        $env:CLAUDE_RTL_TRUSTED_PUBKEY = $pinned.PubB64
         $env:CLAUDE_RTL_AUTO = '1'
         Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
             -ArgumentList @(
                 '-NoProfile',
                 '-ExecutionPolicy', 'Bypass',
-                '-Command', "irm $installUrl | iex"
+                '-File', $tmpFile,
+                '-Auto'
             ) | Out-Null
-        Write-WLog "Spawned: powershell -Command 'irm install.ps1 | iex' (CLAUDE_RTL_AUTO=1)"
+        Write-WLog "Spawned verified patch.ps1 (file=$tmpFile)"
     } catch {
-        Write-WLog "Failed to launch installer: $($_.Exception.Message)"
+        Write-WLog "Failed to launch patch.ps1: $($_.Exception.Message)"
         Show-Toast "Auto-patch FAILED to start" "Please run patch.ps1 manually as Administrator. See watcher.log."
     } finally {
         Remove-Item Env:CLAUDE_RTL_AUTO -ErrorAction SilentlyContinue
+        Remove-Item Env:CLAUDE_RTL_TRUSTED_PUBKEY -ErrorAction SilentlyContinue
     }
 }
 
@@ -1692,11 +1940,62 @@ function Install-Patch {
         Write-Step "Cleanup & Launch"
         if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
         Save-PatchState -InstallPath $ClaudeDir
+
+        # Pin the maintainer's pubkey on EVERY install, not only when the watcher
+        # is enabled. The local update.ps1 (desktop shortcut) reads the same pin,
+        # so if a user installs + creates a shortcut but declines auto-update,
+        # the shortcut would otherwise fail with "no pinned pubkey".
+        Save-TrustedPubkey
+
+        # Always write the local verified-update helper so the desktop shortcut
+        # (current or future) can use it. If the shortcut already exists from
+        # an older install pointing at "irm install.ps1 | iex", refresh it to
+        # point at the local helper -- closes the manual-update bypass for
+        # existing users without requiring them to recreate the shortcut.
+        Save-UpdateScript
+        try {
+            $existingShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) "Update Claude RTL.lnk"
+            if (Test-Path $existingShortcut) {
+                Create-UpdateShortcut
+            }
+        } catch {
+            Write-Warn "Update-shortcut refresh failed: $($_.Exception.Message)"
+        }
+
         Start-ClaudeServices
 
         Write-Host "`n=======================================================" -ForegroundColor Green
         Write-Host " PATCH INSTALLATION COMPLETED SUCCESSFULLY! ENJOY!" -ForegroundColor Green
         Write-Host "=======================================================`n" -ForegroundColor Green
+
+        # Loud warning if the trust anchor failed to land. Save-TrustedPubkey
+        # depends on the CLAUDE_RTL_TRUSTED_PUBKEY env var propagating through
+        # the UAC elevation -- this usually works, but a hostile EDR / AV that
+        # intercepts the elevation could strip the environment block. In that
+        # case the auto-update watcher and the desktop shortcut would both
+        # silently refuse to run later. Surface the failure NOW so the user
+        # can re-run rather than discovering it the next time Claude updates.
+        $pinPath = Join-Path $global:RtlStateDir 'trusted-pubkey.b64'
+        if (-not (Test-Path $pinPath)) {
+            Write-Host ""
+            Write-Host "================================================================" -ForegroundColor Red
+            Write-Host "  [!] TRUST ANCHOR NOT PINNED -- AUTO-UPDATE WILL BE DISABLED   " -ForegroundColor Red
+            Write-Host "================================================================" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "The pinned pubkey file was not written to:" -ForegroundColor Yellow
+            Write-Host "  $pinPath" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Most likely cause: this elevated session did not receive the" -ForegroundColor Yellow
+            Write-Host "CLAUDE_RTL_TRUSTED_PUBKEY env var from the launching process" -ForegroundColor Yellow
+            Write-Host "(usually an AV/EDR that strips the environment on UAC)." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Effect: auto-update and the 'Update Claude RTL' shortcut will" -ForegroundColor Yellow
+            Write-Host "REFUSE to run until this is fixed (safe-by-default)." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Fix: re-run the installer from a clean PowerShell session:" -ForegroundColor Cyan
+            Write-Host "  irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1 | iex" -ForegroundColor Cyan
+            Write-Host ""
+        }
 
         if (-not $Auto) {
             $autoPatchPrompt = Read-Host "Do you want to enable Auto Re-Patch after each Claude update? (Y/n)"
@@ -1704,16 +2003,19 @@ function Install-Patch {
                 try { Install-AutoUpdateTask } catch { Write-Warn "Failed to install auto-patch task: $($_.Exception.Message)" }
             }
         } else {
-            # Auto-mode upgrade path: if the user already has a watcher but it predates
-            # the pubkey-pinning logic (no trusted-pubkey.fpr present), re-register the
-            # task with the V2 payload AND write the pin. This is the silent migration
-            # that gives every existing install the takeover protection without any
-            # user action -- it happens once, the next time Claude auto-updates.
+            # Auto-mode upgrade path: re-register the watcher whenever the V2
+            # pubkey pin (trusted-pubkey.b64) is missing. This catches:
+            #   - V0 watchers (no pubkey logic at all)
+            #   - V1 watchers (had trusted-pubkey.fpr fingerprint, but watcher
+            #     still ran install.ps1 -- bypassable via repo takeover)
+            # In both cases the V2 watcher body replaces the old one and
+            # Save-TrustedPubkey writes the full pubkey blob for direct local
+            # signature verification next time around.
             try {
                 $existingTask = Get-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
-                $fpPath = Join-Path $global:RtlStateDir 'trusted-pubkey.fpr'
-                if ($existingTask -and -not (Test-Path $fpPath)) {
-                    Write-Log "Detected V1 watcher without pinned pubkey -- upgrading silently."
+                $pinPath = Join-Path $global:RtlStateDir 'trusted-pubkey.b64'
+                if ($existingTask -and -not (Test-Path $pinPath)) {
+                    Write-Log "Detected legacy watcher without V2 pubkey pin -- upgrading silently."
                     Install-AutoUpdateTask
                 }
             } catch {
