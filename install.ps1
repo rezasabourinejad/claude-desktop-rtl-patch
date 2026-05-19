@@ -92,6 +92,13 @@ if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $conte
 
 Write-Host "Patch verified ($($patchBytes.Length) bytes). Elevating..." -ForegroundColor Green
 
+# Hand the elevated patch.ps1 the pubkey blob we just verified against. patch.ps1
+# uses it to pin the trust anchor for the auto-update watcher (see Save-TrustedPubkey
+# in patch.ps1). Env vars set here propagate to the elevated child via Start-Process.
+# Passing it (rather than letting patch.ps1 re-download install.ps1 itself) avoids a
+# TOCTOU window where the repo could change between our verify and patch.ps1's pin.
+$env:CLAUDE_RTL_TRUSTED_PUBKEY = $ExpectedPubKey
+
 # Same launch line as the original installer -- nothing user-facing has changed.
 # -NoExit keeps the elevated window open so the user can read the patch log.
 Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -NoExit -ExecutionPolicy Bypass -File `"$TmpFile`""

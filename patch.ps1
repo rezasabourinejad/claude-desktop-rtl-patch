@@ -675,6 +675,42 @@ function Save-PatchState {
     }
 }
 
+function Save-TrustedPubkey {
+    # Pins the SHA-256 of install.ps1's embedded public key to disk. The
+    # auto-update watcher reads this file before every run and refuses to
+    # invoke install.ps1 if the pinned fingerprint no longer matches what the
+    # current install.ps1 ships. This is what makes full-repo-takeover
+    # ineffective against existing installs: the attacker can swap pubkeys in
+    # install.ps1 all they want, but the watcher's trust anchor was captured
+    # at install time and is stored locally beyond their reach.
+    #
+    # The pubkey value arrives via the CLAUDE_RTL_TRUSTED_PUBKEY env var set by
+    # install.ps1. Using the env var (not a fresh download) avoids a TOCTOU
+    # race where the repo could change between install.ps1's verification and
+    # patch.ps1's pinning step.
+    try {
+        $pubB64 = $env:CLAUDE_RTL_TRUSTED_PUBKEY
+        if (-not $pubB64) {
+            Write-Warn "No CLAUDE_RTL_TRUSTED_PUBKEY env var; trusted-pubkey.fpr will not be written."
+            Write-Warn "(Auto-update watcher will refuse to run without it -- this is the safe default.)"
+            return
+        }
+        $pubBytes = [Convert]::FromBase64String($pubB64)
+        $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($pubBytes)
+        $fp = ([BitConverter]::ToString($sha)).Replace('-', '').ToLower()
+
+        if (-not (Test-Path $global:RtlStateDir)) {
+            New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
+        }
+        $fpPath = Join-Path $global:RtlStateDir 'trusted-pubkey.fpr'
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [IO.File]::WriteAllText($fpPath, $fp, $utf8NoBom)
+        Write-Log "Trusted pubkey fingerprint pinned: $fp"
+    } catch {
+        Write-Warn "Save-TrustedPubkey failed: $($_.Exception.Message)"
+    }
+}
+
 function Find-ClaudeDir {
     $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' } | Select-Object -First 1
     if ($pkg) { return $pkg.InstallLocation }
@@ -1111,14 +1147,26 @@ function Install-AutoUpdateTask {
         return
     }
 
+    # Pin the maintainer's pubkey fingerprint BEFORE registering the task. The
+    # watcher refuses to invoke install.ps1 unless its embedded pubkey matches
+    # this pin -- closes the "full repo takeover" vector for existing installs.
+    Save-TrustedPubkey
+
     # Single-quoted here-string: $ signs are preserved literally for runtime evaluation inside the watcher.
     $watcher = @'
 $ErrorActionPreference = "Continue"
+# Scheduled Task PowerShell defaults to TLS 1.0, which GitHub rejects. Force 1.2
+# so Test-TrustedPubkey's WebClient call to raw.githubusercontent.com succeeds.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
 $stateDir       = Join-Path $env:ProgramData "ClaudeRtlPatch"
 $stateFile      = Join-Path $stateDir "state.json"
 $logFile        = Join-Path $stateDir "watcher.log"
 $lastActionFile = Join-Path $stateDir "last-action.txt"
-# Use install.ps1 — same path as the manual "Update Claude RTL" desktop shortcut.
+$pubkeyPinFile  = Join-Path $stateDir "trusted-pubkey.fpr"
+# Use install.ps1 -- same path as the manual "Update Claude RTL" desktop shortcut.
 # install.ps1 handles BOM-encoding and elevation; we just signal Auto mode via env var.
 $installUrl     = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1"
 
@@ -1170,6 +1218,43 @@ function Get-PatchedVer {
     return $null
 }
 
+function Test-TrustedPubkey {
+    # The watcher's local trust anchor. Compares the SHA-256 of install.ps1's
+    # currently-embedded $ExpectedPubKey against the fingerprint stored on disk
+    # at install time. Mismatch = the GitHub repo published a different pubkey
+    # than the one the user pinned -- could be a legit key rotation by the
+    # maintainer (manual re-install required) or a compromised repository.
+    # Either way we refuse to run automatically.
+    try {
+        if (-not (Test-Path $pubkeyPinFile)) {
+            Write-WLog "No pinned pubkey at $pubkeyPinFile -- refusing to auto-update."
+            return $false
+        }
+        $expected = (Get-Content $pubkeyPinFile -Raw).Trim().ToLower()
+        if (-not $expected) {
+            Write-WLog "Pinned pubkey file is empty -- refusing to auto-update."
+            return $false
+        }
+        $content = (New-Object System.Net.WebClient).DownloadString($installUrl)
+        if ($content -notmatch "ExpectedPubKey\s*=\s*'([A-Za-z0-9+/=]+)'") {
+            Write-WLog "Could not extract ExpectedPubKey from remote install.ps1 -- treating as untrusted."
+            return $false
+        }
+        $bytes = [Convert]::FromBase64String($matches[1])
+        $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+        $actual = ([BitConverter]::ToString($sha)).Replace('-', '').ToLower()
+        if ($expected -ne $actual) {
+            Write-WLog "PUBKEY FINGERPRINT MISMATCH! pinned=$expected actual=$actual"
+            return $false
+        }
+        Write-WLog "Pinned pubkey verified ($actual)"
+        return $true
+    } catch {
+        Write-WLog "Test-TrustedPubkey error: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Invoke-AutoPatch($newVer, $exePath) {
     # Throttle: skip if we acted within the last 90 seconds (avoids loops on multi-process Electron startup).
     if (Test-Path $lastActionFile) {
@@ -1183,7 +1268,13 @@ function Invoke-AutoPatch($newVer, $exePath) {
     }
     (Get-Date).ToString('o') | Set-Content $lastActionFile -Encoding UTF8
 
-    Write-WLog "Detected Claude v$newVer at $exePath -- launching install.ps1 (Auto mode)"
+    Write-WLog "Detected Claude v$newVer at $exePath -- checking pinned pubkey before launching installer..."
+    if (-not (Test-TrustedPubkey)) {
+        Show-Toast "Claude RTL: auto-update BLOCKED" "The maintainer's pubkey on GitHub no longer matches the one you pinned. If you trust this change, re-install manually. Until then, the patch will not auto-update."
+        Write-WLog "Auto-update aborted: pinned pubkey check failed."
+        return
+    }
+    Write-WLog "Pinned pubkey OK -- launching install.ps1 (Auto mode)"
     Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
 
     # Kill running Claude processes for snappy UX (patch.ps1 will kill again properly via Stop-ClaudeServices).
@@ -1611,6 +1702,22 @@ function Install-Patch {
             $autoPatchPrompt = Read-Host "Do you want to enable Auto Re-Patch after each Claude update? (Y/n)"
             if ($autoPatchPrompt -ne 'n' -and $autoPatchPrompt -ne 'N') {
                 try { Install-AutoUpdateTask } catch { Write-Warn "Failed to install auto-patch task: $($_.Exception.Message)" }
+            }
+        } else {
+            # Auto-mode upgrade path: if the user already has a watcher but it predates
+            # the pubkey-pinning logic (no trusted-pubkey.fpr present), re-register the
+            # task with the V2 payload AND write the pin. This is the silent migration
+            # that gives every existing install the takeover protection without any
+            # user action -- it happens once, the next time Claude auto-updates.
+            try {
+                $existingTask = Get-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
+                $fpPath = Join-Path $global:RtlStateDir 'trusted-pubkey.fpr'
+                if ($existingTask -and -not (Test-Path $fpPath)) {
+                    Write-Log "Detected V1 watcher without pinned pubkey -- upgrading silently."
+                    Install-AutoUpdateTask
+                }
+            } catch {
+                Write-Warn "Watcher upgrade check failed: $($_.Exception.Message)"
             }
         }
 
