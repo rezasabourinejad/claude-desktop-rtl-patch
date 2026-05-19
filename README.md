@@ -117,6 +117,57 @@ This patch modifies the internal binaries of Claude Desktop in ways that are **n
 
 This project is open source (MIT). Contributions to improve RTL accuracy are welcome — PRs are open. 🙏
 
+## Verification
+
+`install.ps1` verifies an RSA-4096 signature over `patch.ps1` before running it. A compromised GitHub repository alone is **not enough** to ship malicious code to users — the attacker would also need the maintainer's offline private key.
+
+**Public-key fingerprint (SHA-256):**
+
+```
+6e:f4:c2:a6:c2:42:34:a1:5f:e5:cd:e5:5d:a5:b0:3c:94:64:b4:56:7f:81:04:7c:83:9a:50:1c:7c:6f:07:c9
+```
+
+If you're paranoid (and that's a healthy state when running `irm | iex` as Administrator), you can recompute the fingerprint of the public key embedded in `install.ps1` and check it matches the value above:
+
+```powershell
+$content = Invoke-RestMethod "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1"
+if ($content -match "ExpectedPubKey\s*=\s*'([A-Za-z0-9+/=]+)'") {
+    $bytes = [Convert]::FromBase64String($matches[1])
+    $hash  = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+    ([BitConverter]::ToString($hash)).Replace('-', ':').ToLower()
+}
+```
+
+A mismatch means the embedded key was swapped — do **not** proceed; report it as a security issue.
+
+To audit a release manually without installing:
+
+```powershell
+git clone https://github.com/shraga100/claude-desktop-rtl-patch
+cd claude-desktop-rtl-patch
+powershell -ExecutionPolicy Bypass -File tools\verify-signature.ps1
+```
+
+The verifier reads the public key embedded in `install.ps1`, downloads no remote data, and exits 0 only on success.
+
+### For maintainers
+
+After cloning, install the pre-commit hook once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\install-hooks.ps1
+```
+
+Whenever you edit `patch.ps1`, re-sign before committing:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\sign-release.ps1
+git add patch.ps1 patch.ps1.sig
+git commit ...
+```
+
+The hook will block any commit that touches `patch.ps1`, `patch.ps1.sig`, or `install.ps1` if the signature does not match — so a forgotten re-sign cannot reach `main`.
+
 ## Troubleshooting
 
 **"Node.js (npx) is required"** — Install Node.js from [nodejs.org](https://nodejs.org/) and reopen PowerShell.

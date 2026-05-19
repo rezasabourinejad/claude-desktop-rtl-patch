@@ -20,19 +20,13 @@ if (-not $Auto -and $env:CLAUDE_RTL_AUTO -eq '1') { $Auto = $true }
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
-    $autoArg = if ($Auto) { ' -Auto' } else { '' }
-    # Always download to TEMP and save with UTF-8 BOM before elevating. This unifies both
-    # invocation paths (local .ps1 file and `irm | iex`) and guarantees the elevated
-    # PowerShell receives a file that PSv5.1 can parse — without a BOM it falls back to
-    # the ANSI codepage and fails on Hebrew/box-drawing characters. `-NoExit` keeps the
-    # elevated window open so early errors (parse, init, missing Claude install) stay
-    # visible instead of flashing and closing.
-    $TmpScript = Join-Path $env:TEMP "claude_rtl_patch.ps1"
-    $RepoUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
-    Write-Host "Downloading script to temp file for elevation..." -ForegroundColor Cyan
-    $content = Invoke-RestMethod -Uri $RepoUrl
-    [System.IO.File]::WriteAllText($TmpScript, $content, [System.Text.UTF8Encoding]::new($true))
-    Start-Process -FilePath PowerShell.exe -Verb RunAs -ArgumentList "-NoProfile -NoExit -ExecutionPolicy Bypass -File `"$TmpScript`"$autoArg"
+    # Route elevation through install.ps1 so every run uses the same signature-verified
+    # path. Re-downloading patch.ps1 here would bypass the RSA check in install.ps1 and
+    # reopen the supply-chain hole (C1). install.ps1 fetches + verifies + Start-Process
+    # -Verb RunAs for the actual elevation. Auto mode propagates via env var.
+    $InstallUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1"
+    if ($Auto) { $env:CLAUDE_RTL_AUTO = '1' }
+    Invoke-Expression (Invoke-RestMethod $InstallUrl)
     Exit
 }
 
@@ -42,6 +36,12 @@ if (-not $IsAdmin) {
 $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue
 $global:TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "claude_rtl_patch_tmp"
+
+# Pinned npm packages (C4 mitigation). 'asar' (unscoped) was deprecated by Electron;
+# @electron/asar is the maintained drop-in replacement. Bump these by hand after
+# reviewing the upstream changelog — never use 'latest', which is a moving target.
+$script:AsarPackage  = '@electron/asar@4.2.0'
+$script:FusesPackage = '@electron/fuses@2.1.1'
 
 # Exact JS logic from r.js
 $RTL_INJECTION_CODE = @'
@@ -122,36 +122,20 @@ $RTL_INJECTION_CODE = @'
 
         function splitToDirectionalSpans(el) {
             if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
-            // Capturing split: even indices are content, odd indices are the
-            // separator tokens that we want to drop.
-            var segments = el.innerHTML.split(BR_OR_NL_SPLIT);
-            var pieces = [];
-            for (var idx = 0; idx < segments.length; idx += 2) {
-                pieces.push(segments[idx]);
-            }
-            if (pieces.length < 2) return;
-
-            var built = [];
-            for (var p = 0; p < pieces.length; p++) {
-                var chunk = pieces[p];
-                var bare = chunk.replace(/<[^>]+>/g, '').trim();
-                if (bare.length === 0) {
-                    built.push('<span style="display:block;min-height:1em"></span>');
-                    continue;
-                }
-                var pickedDir = detectTextDir(bare);
-                var dirAttr = pickedDir ? ' dir="' + pickedDir + '"' : '';
-                built.push('<span' + dirAttr +
-                           ' style="display:block;text-align:start">' + chunk + '</span>');
-            }
-
-            // Stamp first so an observer callback re-entering during the
-            // innerHTML swap sees us as already processed.
+            // No DOM rewriting — the previous version assigned to el.innerHTML which
+            // broke React reconciliation ("Failed to execute 'removeChild' on 'Node'":
+            // React tried to remove children whose identity we had just replaced).
+            //
+            // Instead, defer to unicode-bidi:plaintext. The CSS injected below already
+            // applies plaintext to :not([dir]) elements, and <br> is a paragraph
+            // separator in the Unicode BiDi algorithm — so each line auto-picks its
+            // direction from first-strong character without us touching the DOM.
+            // We mark the flag so processContainers won't try to handle the subtree.
             el.setAttribute(RTL_SPLIT_FLAG, '1');
             if (el.hasAttribute('dir')) el.removeAttribute('dir');
             el.style.direction = '';
-            el.style.textAlign = '';
-            el.innerHTML = built.join('');
+            el.style.textAlign = 'start';
+            el.style.unicodeBidi = 'plaintext';
         }
 
         // Used by the no-RTL branches below: if the element inherits RTL purely
@@ -1020,7 +1004,7 @@ $script:AsarFuseDisabledPattern = 'EnableEmbeddedAsarIntegrityValidation[^\r\n]*
 
 function Get-FuseProbeOutput {
     param([Parameter(Mandatory)][string]$ExePath)
-    $raw = cmd.exe /c "npx --yes @electron/fuses read --app `"$ExePath`" 2>&1"
+    $raw = cmd.exe /c "npx --yes $($script:FusesPackage) read --app `"$ExePath`" 2>&1"
     return ($raw | Out-String)
 }
 
@@ -1031,7 +1015,7 @@ function Test-AsarIntegrityFuseDisabled {
 
 function Set-AsarIntegrityFuseOff {
     param([Parameter(Mandatory)][string]$ExePath)
-    $raw = cmd.exe /c "npx --yes @electron/fuses write --app `"$ExePath`" EnableEmbeddedAsarIntegrityValidation=off 2>&1"
+    $raw = cmd.exe /c "npx --yes $($script:FusesPackage) write --app `"$ExePath`" EnableEmbeddedAsarIntegrityValidation=off 2>&1"
     return [pscustomobject]@{ Output = ($raw | Out-String); ExitCode = $LASTEXITCODE }
 }
 
@@ -1330,7 +1314,7 @@ function Install-Patch {
     if (-not (Test-Path $AsarPath)) { throw "app.asar not found!" }
 
     Try {
-        $cmdOut = cmd.exe /c "npx --yes asar --version 2>&1"
+        $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
         if ($LASTEXITCODE -ne 0) { throw "ASAR missing" }
     } Catch {
         throw "Node.js (npx) is required. Please install Node.js."
@@ -1394,7 +1378,7 @@ function Install-Patch {
 
         if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
         Write-Log "Extracting ASAR archive (this may take a moment)..."
-        cmd.exe /c "npx --yes asar extract `"$AsarPath`" `"$global:TmpDir`""
+        cmd.exe /c "npx --yes $($script:AsarPackage) extract `"$AsarPath`" `"$global:TmpDir`""
         if ($LASTEXITCODE -ne 0) {
             throw "asar extract failed with exit code $LASTEXITCODE. Aborting before pack would create an empty archive."
         }
@@ -1419,7 +1403,7 @@ function Install-Patch {
 
         $TmpAsarPath = "$AsarPath.new"
         Write-Log "Repacking ASAR archive..."
-        cmd.exe /c "npx --yes asar pack `"$global:TmpDir`" `"$TmpAsarPath`""
+        cmd.exe /c "npx --yes $($script:AsarPackage) pack `"$global:TmpDir`" `"$TmpAsarPath`""
         if ($LASTEXITCODE -ne 0) {
             if (Test-Path -LiteralPath $TmpAsarPath) { Remove-Item -LiteralPath $TmpAsarPath -Force -ErrorAction SilentlyContinue }
             throw "asar pack failed with exit code $LASTEXITCODE."
