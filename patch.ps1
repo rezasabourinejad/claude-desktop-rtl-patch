@@ -1334,26 +1334,22 @@ function Create-UpdateShortcut {
 
 # -----------------------------------------------------------------------------
 # AUTO-UPDATE WATCHER (Scheduled Task)
-# Watches for new claude.exe processes from a higher version path and triggers
-# the patch automatically. The watcher script is embedded as a base64-encoded
-# command in the Scheduled Task XML — no extra files on disk.
+# The watcher is written to %ProgramData%\ClaudeRtlPatch\watcher.ps1 and launched
+# via -File (NOT -EncodedCommand). A readable on-disk script avoids the encoded-
+# PowerShell heuristic that Defender flags as Trojan:Win32/Goptaju once the body
+# also downloads + verifies patch.ps1 from GitHub. The watcher only MONITORS for
+# new claude.exe versions; when it fires it fetches patch.ps1 LIVE from GitHub and
+# runs THAT (see Invoke-AutoPatch) -- never a local copy.
 # -----------------------------------------------------------------------------
-function Install-AutoUpdateTask {
-    Write-Step "Installing Auto-Update Watcher (Scheduled Task)..."
+function Save-WatcherScript {
+    try {
+        if (-not (Test-Path $global:RtlStateDir)) {
+            New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
+        }
+        $watcherPath = Join-Path $global:RtlStateDir 'watcher.ps1'
 
-    if (-not (Test-Path $global:RtlStateFile)) {
-        Write-Warn "No patch state found at $global:RtlStateFile."
-        Write-Warn "Run option 1 (Install Smart RTL Patch) first so the watcher knows which version is patched."
-        return
-    }
-
-    # Pin the maintainer's pubkey fingerprint BEFORE registering the task. The
-    # watcher refuses to invoke install.ps1 unless its embedded pubkey matches
-    # this pin -- closes the "full repo takeover" vector for existing installs.
-    Save-TrustedPubkey
-
-    # Single-quoted here-string: $ signs are preserved literally for runtime evaluation inside the watcher.
-    $watcher = @'
+        # Single-quoted here-string: $ signs are preserved literally for runtime evaluation inside the watcher.
+        $watcherBody = @'
 $ErrorActionPreference = "Continue"
 # Scheduled Task PowerShell defaults to TLS 1.0, which GitHub rejects. Force 1.2
 # so WebClient calls to raw.githubusercontent.com succeed.
@@ -1585,13 +1581,39 @@ while ($true) {
 }
 '@
 
-    Try {
-        $bytes   = [System.Text.Encoding]::Unicode.GetBytes($watcher)
-        $encoded = [Convert]::ToBase64String($bytes)
+        # PS 5.1 needs UTF-8 with BOM to parse Unicode text (Hebrew + toast XML) correctly.
+        [System.IO.File]::WriteAllText($watcherPath, $watcherBody, [System.Text.UTF8Encoding]::new($true))
+        Write-Log "Watcher script written to $watcherPath"
+    } catch {
+        Write-Warn "Save-WatcherScript failed: $($_.Exception.Message)"
+    }
+}
 
+# -----------------------------------------------------------------------------
+# Registers the Scheduled Task that launches the watcher at logon via -File.
+# -----------------------------------------------------------------------------
+function Install-AutoUpdateTask {
+    Write-Step "Installing Auto-Update Watcher (Scheduled Task)..."
+
+    if (-not (Test-Path $global:RtlStateFile)) {
+        Write-Warn "No patch state found at $global:RtlStateFile."
+        Write-Warn "Run option 1 (Install Smart RTL Patch) first so the watcher knows which version is patched."
+        return
+    }
+
+    # Pin the maintainer's pubkey BEFORE registering the task. The watcher
+    # verifies patch.ps1 against this pinned pubkey -- closes the "full repo
+    # takeover" vector for existing installs.
+    Save-TrustedPubkey
+
+    # Write the watcher to disk; the task launches it via -File (not -EncodedCommand).
+    Save-WatcherScript
+    $watcherPath = Join-Path $global:RtlStateDir 'watcher.ps1'
+
+    Try {
         $userName  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
-            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encoded"
+            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherPath`""
         $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $userName
         $settings  = New-ScheduledTaskSettingsSet `
             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
@@ -1626,6 +1648,7 @@ function Uninstall-AutoUpdateTask {
         Stop-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $global:RtlTaskName -Confirm:$false -ErrorAction Stop
         Write-Success "Scheduled Task '$global:RtlTaskName' removed."
+        Remove-Item (Join-Path $global:RtlStateDir 'watcher.ps1') -Force -ErrorAction SilentlyContinue
         Write-Log "State file at $global:RtlStateFile was kept. Use option 2 (Restore) to remove all state."
     } Catch {
         Write-Warn "Failed to remove scheduled task: $($_.Exception.Message)"
@@ -2003,19 +2026,24 @@ function Install-Patch {
                 try { Install-AutoUpdateTask } catch { Write-Warn "Failed to install auto-patch task: $($_.Exception.Message)" }
             }
         } else {
-            # Auto-mode upgrade path: re-register the watcher whenever the V2
-            # pubkey pin (trusted-pubkey.b64) is missing. This catches:
-            #   - V0 watchers (no pubkey logic at all)
-            #   - V1 watchers (had trusted-pubkey.fpr fingerprint, but watcher
-            #     still ran install.ps1 -- bypassable via repo takeover)
-            # In both cases the V2 watcher body replaces the old one and
-            # Save-TrustedPubkey writes the full pubkey blob for direct local
-            # signature verification next time around.
+            # Auto-mode upgrade path: re-register the watcher whenever the
+            # installed task predates the current on-disk format. This catches:
+            #   - V0/V1/V2 watchers embedded as -EncodedCommand (the encoded
+            #     blob that Defender flags as Trojan:Win32/Goptaju), and
+            #   - any install missing the V2 pubkey pin (trusted-pubkey.b64).
+            # Re-registering rewrites the task to launch watcher.ps1 via -File
+            # and refreshes the pinned pubkey for local signature verification.
             try {
                 $existingTask = Get-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
                 $pinPath = Join-Path $global:RtlStateDir 'trusted-pubkey.b64'
-                if ($existingTask -and -not (Test-Path $pinPath)) {
-                    Write-Log "Detected legacy watcher without V2 pubkey pin -- upgrading silently."
+                $needsUpgrade = $false
+                if ($existingTask) {
+                    $argStr = ($existingTask.Actions | ForEach-Object { $_.Arguments }) -join ' '
+                    if ($argStr -notmatch 'watcher\.ps1') { $needsUpgrade = $true }
+                }
+                if (-not (Test-Path $pinPath)) { $needsUpgrade = $true }
+                if ($existingTask -and $needsUpgrade) {
+                    Write-Log "Detected legacy/encoded watcher -- upgrading to on-disk watcher.ps1 silently."
                     Install-AutoUpdateTask
                 }
             } catch {
