@@ -7,11 +7,19 @@
     Strictly uses PURE BYTE-ARRAY manipulation matching the original Python script.
 #>
 param(
-    [switch]$Auto
+    [switch]$Auto,
+    [string]$TrustedPubKey
 )
 
 # Env-var fallback for `irm | iex` invocations where param binding is not possible.
 if (-not $Auto -and $env:CLAUDE_RTL_AUTO -eq '1') { $Auto = $true }
+
+# The trusted pubkey is passed as a PARAMETER, not an env var: environment
+# variables set by install.ps1 / update.ps1 before Start-Process -Verb RunAs do
+# NOT survive the UAC elevation boundary, so the elevated patch.ps1 would never
+# see them and Save-TrustedPubkey would skip the pin. Mirror the param into the
+# env var the rest of the script already reads.
+if ($TrustedPubKey) { $env:CLAUDE_RTL_TRUSTED_PUBKEY = $TrustedPubKey }
 
 # -----------------------------------------------------------------------------
 # AUTO-ELEVATION: Request Administrator Privileges Automatically
@@ -881,11 +889,10 @@ if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $conte
 
 Write-Host "Patch verified ($($patchBytes.Length) bytes). Elevating..." -ForegroundColor Green
 
-# Propagate the pinned pubkey so the elevated child's Save-TrustedPubkey (if
-# it runs during a watcher re-registration) sees the SAME trust anchor.
-# CLAUDE_RTL_AUTO=1 tells patch.ps1 to run Install-Patch directly instead of
-# showing the menu -- matching the documented "1-click update" behavior.
-$env:CLAUDE_RTL_TRUSTED_PUBKEY = $pubB64
+# Pass the pinned pubkey as a -TrustedPubKey PARAMETER so the elevated child's
+# Save-TrustedPubkey sees the SAME trust anchor. An env var would NOT survive the
+# Start-Process -Verb RunAs UAC boundary. CLAUDE_RTL_AUTO=1 tells patch.ps1 to run
+# Install-Patch directly instead of showing the menu (the "1-click update" path).
 $env:CLAUDE_RTL_AUTO = '1'
 
 # Elevate via UAC. patch.ps1's Auto mode pauses on Read-Host at the end, so
@@ -894,7 +901,7 @@ Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.e
     -Verb RunAs `
     -ArgumentList @(
         '-NoProfile','-ExecutionPolicy','Bypass',
-        '-File',$tmpFile,'-Auto'
+        '-File',$tmpFile,'-Auto','-TrustedPubKey',$pubB64
     )
 '@
 
