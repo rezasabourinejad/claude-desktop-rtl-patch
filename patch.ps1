@@ -1686,7 +1686,25 @@ function Install-Patch {
         $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
         if ($LASTEXITCODE -ne 0) { throw "ASAR missing" }
     } Catch {
-        throw "Node.js (npx) is required. Please install Node.js."
+        # npx failed. Common cause: a Node version manager (e.g. Volta) puts a shim
+        # ahead of real Node on PATH, and the shim does not work in the elevated
+        # context the patch runs in (the user's own PATH edits are also lost across
+        # the UAC boundary -- a fresh elevated process rebuilds PATH from the
+        # registry). If a standard system-wide Node is installed, prepend it so npx
+        # resolves to the real binary, and retry once. The PATH prepend persists for
+        # every later npx call in this run (asar extract/pack, fuse read/write).
+        $sysNodeDir = Join-Path $env:ProgramFiles 'nodejs'
+        $ok = $false
+        if ((Test-Path (Join-Path $sysNodeDir 'node.exe')) -and `
+            (Test-Path (Join-Path $sysNodeDir 'npx.cmd'))) {
+            $env:PATH = "$sysNodeDir;$env:PATH"
+            Write-Log "npx not found via PATH; using system Node at $sysNodeDir"
+            $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
+            $ok = ($LASTEXITCODE -eq 0)
+        }
+        if (-not $ok) {
+            throw "Node.js (npx) is required. Please install Node.js."
+        }
     }
 
     Stop-ClaudeServices
