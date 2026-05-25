@@ -176,6 +176,12 @@ The hook will block any commit that touches `patch.ps1`, `patch.ps1.sig`, or `in
 
 **Claude updated and the patch broke** — Run the "Update Claude RTL" desktop shortcut, or use the Auto-Updater. If doing it manually, delete any `.bak` files in the Claude app directory and run the installer again.
 
+**`Import-Module ... The member AuditToString is already present`** — You ran the command in **PowerShell 7**, which has a known bug that breaks the patch. Use the built-in **Windows PowerShell** instead (it always ships with Windows):
+
+1. Press **Win + R**, type `powershell`, and hit **Enter** — this opens the classic **blue** Windows PowerShell window (not the black PowerShell 7 / `pwsh` one).
+   *(Or: click Start, type "Windows PowerShell", and open the blue icon.)*
+2. Paste the install command from above and run it.
+
 ## Uninstall
 
 Run the script and choose option **2 (Restore)**. This restores all original files from backup and removes the self-signed certificate from your Windows certificate store. If you installed the Auto-Updater, choose option **5** to disable it.
