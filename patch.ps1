@@ -66,6 +66,11 @@ $global:TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "claude_rtl_patch_t
 # reviewing the upstream changelog — never use 'latest', which is a moving target.
 $script:AsarPackage  = '@electron/asar@4.2.0'
 $script:FusesPackage = '@electron/fuses@2.1.1'
+# Minimum Node these pinned packages will run on (both declare engines.node
+# >=22.12.0). Keep in sync when bumping the packages above. Used to turn the old
+# misleading "install Node" error into a precise "upgrade Node" message when an
+# older Node (e.g. the EOL v18) is present but too old to run the toolchain.
+$script:MinNodeVersion = '22.12.0'
 
 # Exact JS logic from r.js
 $RTL_INJECTION_CODE = @'
@@ -1686,24 +1691,54 @@ function Install-Patch {
         $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
         if ($LASTEXITCODE -ne 0) { throw "ASAR missing" }
     } Catch {
-        # npx failed. Common cause: a Node version manager (e.g. Volta) puts a shim
-        # ahead of real Node on PATH, and the shim does not work in the elevated
-        # context the patch runs in (the user's own PATH edits are also lost across
-        # the UAC boundary -- a fresh elevated process rebuilds PATH from the
-        # registry). If a standard system-wide Node is installed, prepend it so npx
-        # resolves to the real binary, and retry once. The PATH prepend persists for
-        # every later npx call in this run (asar extract/pack, fuse read/write).
+        # The npx probe failed. Two distinct causes, with very different fixes:
+        #
+        #  1) npx/Node not reachable. A Node version manager (e.g. Volta) can put a
+        #     shim ahead of real Node on PATH, and that shim does not work in the
+        #     elevated context the patch runs in (the user's own PATH edits are also
+        #     lost across the UAC boundary -- a fresh elevated process rebuilds PATH
+        #     from the registry). If a standard system-wide Node exists, prepend it
+        #     and retry once. The prepend persists for every later npx call this run.
+        #
+        #  2) Node is present but too OLD. The pinned @electron/asar / @electron/fuses
+        #     require Node >= $script:MinNodeVersion; on older Node (e.g. the EOL v18)
+        #     npx resolves fine but the tool refuses to run. The generic "install
+        #     Node" message is misleading there -- surface the real version and tell
+        #     the user to UPGRADE.
         $sysNodeDir = Join-Path $env:ProgramFiles 'nodejs'
         $ok = $false
         if ((Test-Path (Join-Path $sysNodeDir 'node.exe')) -and `
             (Test-Path (Join-Path $sysNodeDir 'npx.cmd'))) {
             $env:PATH = "$sysNodeDir;$env:PATH"
-            Write-Log "npx not found via PATH; using system Node at $sysNodeDir"
+            Write-Log "npx probe failed; retrying with system Node at $sysNodeDir"
             $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
             $ok = ($LASTEXITCODE -eq 0)
         }
         if (-not $ok) {
-            throw "Node.js (npx) is required. Please install Node.js."
+            # Record npx's real output so the failure is diagnosable from patch.log.
+            if ($cmdOut) { Write-Log "npx output: $(($cmdOut | Out-String).Trim())" }
+
+            # Detect the installed Node version to give an accurate error.
+            $nodeVer = $null
+            try {
+                $raw = (cmd.exe /c "node --version 2>&1" | Out-String).Trim()
+                if ($raw -match 'v?(\d+)\.(\d+)\.(\d+)') {
+                    $nodeVer = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+                }
+            } catch {}
+
+            $minVer = [version]$script:MinNodeVersion
+            if ($nodeVer -and $nodeVer -lt $minVer) {
+                throw ("Node $nodeVer is too old. This patch requires Node " +
+                    ">= $($script:MinNodeVersion) (Node $nodeVer is past end-of-life). " +
+                    "Please upgrade Node from https://nodejs.org and re-run.")
+            } elseif (-not $nodeVer) {
+                throw ("Node.js (npx) is required. Please install Node.js " +
+                    "(>= $($script:MinNodeVersion)) from https://nodejs.org and re-run.")
+            } else {
+                throw ("npx could not run $($script:AsarPackage) on Node $nodeVer. " +
+                    "See the npx output in the log: $global:PatchLogFile")
+            }
         }
     }
 
