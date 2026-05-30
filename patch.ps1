@@ -1807,9 +1807,26 @@ function Install-Patch {
 
         $BuildDir = Join-Path $global:TmpDir ".vite\build"
         if (Test-Path $BuildDir) {
+            # Files that run OUTSIDE the renderer (main process / MCP host / Node workers).
+            # They have no DOM, so the renderer-only RTL snippet is a guarded no-op there;
+            # injecting into them gives no benefit and risks interfering with MCP server
+            # startup (issue #14). index.js is the main-process bundle that SPAWNS the MCP
+            # hosts. Skip them entirely; RTL still works via the window preload scripts.
+            $SkipNonRenderer = @(
+                'index.js',                 # .vite/build/index.js         - main process entry
+                'index.pre.js',             # .vite/build/index.pre.js     - main process bootstrap
+                'directMcpHost.js',         # .vite/build/mcp-runtime/...  - Node MCP host
+                'nodeHost.js',              # .vite/build/mcp-runtime/...  - Node host
+                'shellPathWorker.js',       # .vite/build/shell-path-worker/...
+                'transcriptSearchWorker.js' # .vite/build/transcript-search-worker/...
+            )
             $JsFiles = Get-ChildItem -Path $BuildDir -Filter "*.js" -Recurse
             $Injected = 0
             foreach ($file in $JsFiles) {
+                if ($SkipNonRenderer -contains $file.Name) {
+                    Write-Log "Skipped non-renderer file (no DOM): $($file.Name)"
+                    continue
+                }
                 $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
                 if ($content -match "CLAUDE RTL PATCH START") { continue }
 
@@ -2231,6 +2248,14 @@ function Restore-Patch {
         Write-Success "Custom certificates removed from system store."
     } Catch {
         Write-Warn "Failed to remove some certificates."
+    }
+
+    # A user-initiated restore should leave nothing behind that could re-apply the
+    # patch. Remove the auto-update watcher scheduled task so a broken patch can't
+    # silently re-install on the next logon (issue #14 side note). Skip this on the
+    # in-patch rollback path, which must not tear down the watcher mid-patch.
+    if (-not $IsRollback) {
+        Uninstall-AutoUpdateTask
     }
 
     Start-ClaudeServices
