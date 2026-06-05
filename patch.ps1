@@ -975,14 +975,32 @@ function Stop-ClaudeServices {
     Write-Success "Processes and services halted."
 }
 
-function Test-FileLock([string]$Path) {
+function Test-FileLock([string]$Path, [string]$Access = 'Write') {
     <#
     .SYNOPSIS
-        Returns $true if the file is locked by another process, $false if writable.
+        Returns $true if the file can't be opened for the requested $Access, $false otherwise.
+    .PARAMETER Access
+        'Read' for read-only operations (e.g. creating a backup); 'Write' for writes (default).
+        The probe must replicate EXACTLY what the real operation does, or it could green-light
+        a step that then fails (or falsely block one that would succeed).
+    .NOTES
+        The probe mirrors the real operations' sharing semantics:
+          * write probe (FileAccess.Write, FileShare.Read)  == [IO.File]::WriteAllBytes
+          * read  probe (FileAccess.Read,  FileShare.Read)  == [IO.File]::ReadAllBytes / Copy
+        FileMode.Open (never Create) keeps the probe non-destructive.
+
+        This replaces the old (FileAccess.ReadWrite, FileShare.None) probe, which was both:
+          - too strict on share: it reported LOCKED whenever ANY coexisting handle existed,
+            even a benign read-share handle from an AV/indexer scanning the 200+ MB claude.exe
+            right after boot — the false-positive behind issue #15; and
+          - mismatched on access: it demanded ReadWrite even for read-only backup steps.
+        FileShare.Read (not ReadWrite) is deliberate: WriteAllBytes itself uses FileShare.Read,
+        so a permissive FileShare.ReadWrite probe could pass while WriteAllBytes then fails
+        against a coexisting writer. Matching FileShare.Read keeps probe == real op.
     #>
     if (-not (Test-Path $Path)) { return $false }
     try {
-        $fs = [System.IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
+        $fs = [System.IO.File]::Open($Path, 'Open', $Access, 'Read')
         $fs.Close()
         return $false
     } catch {
@@ -990,14 +1008,14 @@ function Test-FileLock([string]$Path) {
     }
 }
 
-function Wait-FileUnlock([string]$Path, [int]$TimeoutSeconds = 20) {
+function Wait-FileUnlock([string]$Path, [int]$TimeoutSeconds = 20, [string]$Access = 'Write') {
     <#
     .SYNOPSIS
-        Waits until a file is no longer locked, or throws after timeout.
+        Waits until a file can be opened for the requested $Access, or throws after timeout.
     #>
     if (-not (Test-Path $Path)) { return }
     for ($w = 0; $w -lt $TimeoutSeconds; $w++) {
-        if (-not (Test-FileLock $Path)) {
+        if (-not (Test-FileLock $Path $Access)) {
             Write-Log "File unlocked: $(Split-Path $Path -Leaf)"
             return
         }
@@ -1022,6 +1040,186 @@ function Get-FileHolders([string]$Path) {
         }
         return ($holders | Select-Object -Unique)
     } catch { return @() }
+}
+
+# Windows Restart Manager gives the AUTHORITATIVE list of processes/services holding a
+# file open — far more reliable than walking Get-Process module lists (Get-FileHolders),
+# which misses services and files held without a loaded module. Ported from
+# tools/claude-lock-diag.ps1. Advisory only: used to name holders in preflight errors.
+$script:RmLockTypeLoaded = $false
+function Initialize-RmLockType {
+    if ($script:RmLockTypeLoaded) { return $true }
+    try {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class RmLock {
+    [StructLayout(LayoutKind.Sequential)]
+    struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+    const int CCH_RM_MAX_APP_NAME = 255;
+    const int CCH_RM_MAX_SVC_NAME = 63;
+    enum RM_APP_TYPE { RmUnknownApp=0, RmMainWindow=1, RmOtherWindow=2, RmService=3, RmExplorer=4, RmConsole=5, RmCritical=1000 }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct RM_PROCESS_INFO {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)] public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)] public string strServiceShortName;
+        public RM_APP_TYPE ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+    }
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmEndSession(uint pSessionHandle);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, [In] RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+    public static List<string> GetLockers(string path) {
+        var result = new List<string>();
+        uint handle; string key = Guid.NewGuid().ToString();
+        int res = RmStartSession(out handle, 0, key);
+        if (res != 0) throw new Exception("RmStartSession failed: " + res);
+        try {
+            string[] resources = new string[] { path };
+            res = RmRegisterResources(handle, (uint)resources.Length, resources, 0, null, 0, null);
+            if (res != 0) throw new Exception("RmRegisterResources failed: " + res);
+            uint needed = 0, count = 0, reason = 0;
+            res = RmGetList(handle, out needed, ref count, null, ref reason);
+            if (res == 234 /*ERROR_MORE_DATA*/) {
+                var info = new RM_PROCESS_INFO[needed];
+                count = needed;
+                res = RmGetList(handle, out needed, ref count, info, ref reason);
+                if (res != 0) throw new Exception("RmGetList(2) failed: " + res);
+                for (int i = 0; i < count; i++)
+                    result.Add(info[i].strAppName + " (PID " + info[i].Process.dwProcessId + ", type " + info[i].ApplicationType + ")");
+            } else if (res != 0) {
+                throw new Exception("RmGetList(1) failed: " + res);
+            }
+        } finally { RmEndSession(handle); }
+        return result;
+    }
+}
+'@
+        $script:RmLockTypeLoaded = $true
+        return $true
+    } catch {
+        # A second Add-Type of the same type in one session throws "already exists" —
+        # treat that as success. Any other failure: degrade to no holder list (advisory).
+        if ("$($_.Exception.Message)" -match 'already') { $script:RmLockTypeLoaded = $true; return $true }
+        Write-Log "Restart Manager unavailable (holder names will be omitted): $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-FileLockers([string]$Path) {
+    # Returns @("AppName (PID n, type RmService)", ...) or @(). Never throws.
+    try {
+        if (-not (Initialize-RmLockType)) { return @() }
+        if (-not (Test-Path -LiteralPath $Path)) { return @() }
+        return [RmLock]::GetLockers($Path)
+    } catch {
+        return @()
+    }
+}
+
+function Get-FileWriteStatus([string]$Path) {
+    <#
+    .SYNOPSIS
+        Single-shot classification of a file's writability, for preflight messaging.
+        Status: MISSING (file absent) | OK (writable) | DENIED (ACL) | LOCKED (sharing).
+        On DENIED/LOCKED also resolves the holding process(es) via Restart Manager.
+    #>
+    $name = Split-Path $Path -Leaf
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Path = $Path; Name = $name; Status = 'MISSING'; Holders = @() }
+    }
+    try {
+        # Match WriteAllBytes exactly: FileAccess.Write + FileShare.Read, FileMode.Open
+        # (non-destructive). See Test-FileLock notes.
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Write', 'Read')
+        $fs.Close()
+        return [pscustomobject]@{ Path = $Path; Name = $name; Status = 'OK'; Holders = @() }
+    } catch [System.UnauthorizedAccessException] {
+        return [pscustomobject]@{ Path = $Path; Name = $name; Status = 'DENIED'; Holders = (Get-FileLockers $Path) }
+    } catch {
+        # IOException (sharing violation) and anything else → treat as locked.
+        return [pscustomobject]@{ Path = $Path; Name = $name; Status = 'LOCKED'; Holders = (Get-FileLockers $Path) }
+    }
+}
+
+function Assert-PatchWritable {
+    <#
+    .SYNOPSIS
+        PREFLIGHT: before touching ANY file content, verify every target the whole patch
+        will write to is actually writable. If not, throw a single clear error so the run
+        aborts cleanly with the install untouched — instead of bricking halfway through.
+    .NOTES
+        - Runs AFTER Stop-ClaudeServices + Take-Ownership (writability reflects the ACLs the
+          patch grants itself; before stopping services the binaries are falsely "locked").
+        - Uses a BOUNDED WAIT per target (mirrors the per-step Wait-FileUnlock gates) so it is
+          at least as tolerant as the current code — it can never block a machine the current
+          code would succeed on (e.g. cowork-svc briefly releasing after service stop).
+        - Directory checks are WARN-ONLY (never abort).
+        - Fail-safe: runs before any content change, so the worst case is "refuses to run",
+          never a corrupted file.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$WriteTargets,
+        [string[]]$DirTargets = @(),
+        [int]$TimeoutSeconds = 15
+    )
+    Write-Step "Preflight: verifying all patch targets are writable..."
+
+    $blocked = @()
+    foreach ($t in $WriteTargets) {
+        if (-not (Test-Path -LiteralPath $t)) { continue }   # absent target = nothing to write yet
+        $unlocked = $false
+        for ($w = 0; $w -lt $TimeoutSeconds; $w++) {
+            if (-not (Test-FileLock $t 'Write')) { $unlocked = $true; break }
+            if ($w -eq 0) { Write-Log "Preflight waiting on $(Split-Path $t -Leaf)..." }
+            Start-Sleep -Seconds 1
+        }
+        if ($unlocked) {
+            Write-Success "Writable: $(Split-Path $t -Leaf)"
+        } else {
+            $blocked += (Get-FileWriteStatus $t)
+        }
+    }
+
+    # Directory writability (new .bak/.new files land here) — WARN ONLY, never aborts.
+    foreach ($d in $DirTargets) {
+        try {
+            if (-not (Test-Path -LiteralPath $d)) { continue }
+            $probe = Join-Path $d ("rtl-preflight-{0}.tmp" -f ([guid]::NewGuid().ToString('N')))
+            [System.IO.File]::WriteAllText($probe, 'x')
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Warn "Directory may not be writable (continuing anyway): $d -- $($_.Exception.Message)"
+        }
+    }
+
+    if ($blocked.Count -gt 0) {
+        $lines = foreach ($b in $blocked) {
+            $h = if ($b.Holders -and $b.Holders.Count -gt 0) { " -- held by: " + ($b.Holders -join '; ') } else { "" }
+            "    [$($b.Status)] $($b.Name)$h"
+        }
+        throw @"
+Preflight failed -- the patch was stopped BEFORE modifying anything (your install is untouched).
+These file(s) are not writable right now:
+$($lines -join "`n")
+
+How to fix:
+  * Reboot and, WITHOUT opening Claude, run the patch again (a scanner/indexer can hold a file right after boot).
+  * Temporarily disable real-time antivirus, then re-run.
+  * If it persists, reinstall Claude:  Get-AppxPackage *Claude* | Remove-AppxPackage  then reinstall from https://claude.ai/download
+"@
+    }
+
+    Write-Success "Preflight passed -- all patch targets are writable."
 }
 
 function Test-FileValid([string]$Path, [string]$Type) {
@@ -1748,13 +1946,21 @@ function Install-Patch {
     Take-Ownership $AppDir
     Take-Ownership $ResourcesDir
 
+    # PREFLIGHT: verify EVERY file the whole patch will write is writable, before we touch
+    # any content. Aborts cleanly (install untouched) instead of bricking halfway. Runs here
+    # because writability depends on the ownership just granted and on the services being
+    # stopped above. See Assert-PatchWritable for the fail-safe / bounded-wait guarantees.
+    Assert-PatchWritable -WriteTargets @($AsarPath, $ExePath, $CoworkSvcPath) `
+                         -DirTargets @($ResourcesDir, $AppDir) -TimeoutSeconds 15
+
     Write-Step "Creating secure backups..."
     # Clean up any orphan .bak.tmp files left by a previously interrupted run.
     foreach ($orphan in @("$AsarPath.bak.tmp", "$ExePath.bak.tmp", "$CoworkSvcPath.bak.tmp")) {
         if (Test-Path -LiteralPath $orphan) { Remove-Item -LiteralPath $orphan -Force -ErrorAction SilentlyContinue }
     }
-    Wait-FileUnlock -Path $ExePath -TimeoutSeconds 15
-    Wait-FileUnlock -Path $CoworkSvcPath -TimeoutSeconds 15
+    # Backup READS these files, so a read-access gate is what matches the operation.
+    Wait-FileUnlock -Path $ExePath -TimeoutSeconds 15 -Access Read
+    Wait-FileUnlock -Path $CoworkSvcPath -TimeoutSeconds 15 -Access Read
     if (-not (Test-Path "$AsarPath.bak"))      { Copy-FileSafe $AsarPath      "$AsarPath.bak"      'asar'; Write-Success "app.asar.bak created" }
     if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath))             { Copy-FileSafe $ExePath        "$ExePath.bak"        'pe';   Write-Success "claude.exe.bak created" }
     if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-FileSafe $CoworkSvcPath  "$CoworkSvcPath.bak"  'pe';   Write-Success "cowork-svc.exe.bak created" }
