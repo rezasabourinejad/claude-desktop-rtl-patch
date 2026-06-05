@@ -769,25 +769,13 @@ function Save-TrustedPubkey {
 }
 
 function Save-UpdateScript {
-    # Writes a small local helper to %ProgramData%\ClaudeRtlPatch\update.ps1
-    # used by the desktop "Update Claude RTL" shortcut. The helper does the
-    # SAME verify-then-run dance the auto-update watcher does:
-    #   1. Loads the pinned pubkey from trusted-pubkey.b64.
-    #   2. Downloads patch.ps1 + patch.ps1.sig from GitHub.
-    #   3. Verifies the RSA signature with the pinned key.
-    #   4. Elevates via UAC and runs patch.ps1 -Auto directly.
-    #
-    # The whole point is to keep manual updates off the install.ps1 codepath.
-    # install.ps1 itself is unsigned, so a compromised repo could ship a
-    # malicious install.ps1 that runs as admin once the user clicks the
-    # shortcut (UAC notwithstanding -- the user expects an update prompt and
-    # would consent). With this helper, the shortcut launches LOCAL code only;
-    # the only network artifact we trust is patch.ps1 + its signature.
-    #
-    # The helper is written as admin (this function only runs from Install-Patch
-    # or Install-AutoUpdateTask, both elevated), so non-admin users cannot
-    # tamper with it later -- the file inherits ProgramData ACLs where files
-    # are owned by their elevated creator.
+    # Local helper at %ProgramData%\ClaudeRtlPatch\update.ps1 for the desktop
+    # "Update Claude RTL" shortcut. Mirrors the watcher's verify-then-elevate
+    # flow against the pinned pubkey. Manual updates bypass install.ps1 (which
+    # is unsigned and would otherwise be a code-execution path on a hijacked
+    # repo) -- the only network artifact trusted is patch.ps1 + its signature.
+    # Written from an already-elevated caller, so the file inherits ProgramData
+    # ACLs (admin-only write).
     try {
         if (-not (Test-Path $global:RtlStateDir)) {
             New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
@@ -935,8 +923,7 @@ function Find-ClaudeDir {
 
 function Stop-ClaudeServices {
     Write-Step "Halting Claude processes and services..."
-    
-    # 1. Stop the Windows service via WMI
+
     $wmiSvc = Get-WmiObject Win32_Service | Where-Object { $_.PathName -match "cowork-svc" }
     if ($wmiSvc) {
         Write-Log "Stopping service: $($wmiSvc.Name) (State: $($wmiSvc.State))"
@@ -953,8 +940,7 @@ function Stop-ClaudeServices {
     } else {
         Write-Log "No cowork-svc Windows service found."
     }
-    
-    # 2. Kill any remaining processes
+
     foreach ($procName in @("claude", "cowork-svc")) {
         $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
         if ($procs) {
@@ -962,8 +948,7 @@ function Stop-ClaudeServices {
             $procs | Stop-Process -Force -ErrorAction SilentlyContinue
         }
     }
-    
-    # 3. Wait and verify processes are gone
+
     Start-Sleep -Seconds 2
     $remaining = Get-Process -Name "cowork-svc" -ErrorAction SilentlyContinue
     if ($remaining) {
@@ -1341,9 +1326,9 @@ function Copy-FileSafe([string]$Source, [string]$Dest, [string]$ValidateAs) {
 function Start-ClaudeServices {
     Write-Step "Restarting Claude background service..."
     $Started = $false
-    
-    # 1. Make absolutely sure the service is stopped before starting
-    #    (prevents it from running with old binary still in memory)
+
+    # Force-stop and re-kill any lingering process before Start-Service, so the
+    # service can't pick up the old binary still mapped in memory.
     $wmiSvc = Get-WmiObject Win32_Service | Where-Object { $_.PathName -match "cowork-svc" }
     if ($wmiSvc) {
         $svcName = $wmiSvc.Name
@@ -1358,12 +1343,10 @@ function Start-ClaudeServices {
                 Start-Sleep -Seconds 1
             }
         }
-        
-        # Also kill any lingering process to guarantee the new binary loads fresh
+
         Stop-Process -Name "cowork-svc" -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
-        
-        # Now start
+
         Write-Log "Starting service: $svcName"
         Try {
             Start-Service -Name $svcName -ErrorAction Stop
@@ -1390,7 +1373,6 @@ function Start-ClaudeServices {
         Write-Warn "cowork-svc service not found via WMI."
     }
 
-    # 2. Launch Claude Desktop UI
     Write-Log "Launching Claude Desktop..."
     Try {
         $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' } | Select-Object -First 1
@@ -1889,20 +1871,13 @@ function Install-Patch {
         $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
         if ($LASTEXITCODE -ne 0) { throw "ASAR missing" }
     } Catch {
-        # The npx probe failed. Two distinct causes, with very different fixes:
-        #
-        #  1) npx/Node not reachable. A Node version manager (e.g. Volta) can put a
-        #     shim ahead of real Node on PATH, and that shim does not work in the
-        #     elevated context the patch runs in (the user's own PATH edits are also
-        #     lost across the UAC boundary -- a fresh elevated process rebuilds PATH
-        #     from the registry). If a standard system-wide Node exists, prepend it
-        #     and retry once. The prepend persists for every later npx call this run.
-        #
-        #  2) Node is present but too OLD. The pinned @electron/asar / @electron/fuses
-        #     require Node >= $script:MinNodeVersion; on older Node (e.g. the EOL v18)
-        #     npx resolves fine but the tool refuses to run. The generic "install
-        #     Node" message is misleading there -- surface the real version and tell
-        #     the user to UPGRADE.
+        # The npx probe failed -- two distinct causes with different fixes:
+        #  1) npx unreachable: a Node version manager shim (e.g. Volta) on PATH
+        #     fails under the elevated PATH (rebuilt from the registry across
+        #     UAC). Retry with system Node at %ProgramFiles%\nodejs if present.
+        #  2) Node present but older than $script:MinNodeVersion -- the pinned
+        #     @electron/asar/fuses refuse to run. Surface the version and tell
+        #     the user to upgrade rather than printing "install Node" (issue #11).
         $sysNodeDir = Join-Path $env:ProgramFiles 'nodejs'
         $ok = $false
         if ((Test-Path (Join-Path $sysNodeDir 'node.exe')) -and `
@@ -1996,9 +1971,7 @@ function Install-Patch {
         }
     }
 
-    # ==========================================
-    # START ATOMIC TRANSACTION (TRY/CATCH)
-    # ==========================================
+    # Atomic transaction -- any throw below drops to the Catch and triggers Restore-Patch -IsRollback.
     Try {
         Write-Step "Phase 1: ASAR Injection"
         $OldHash = Compute-AsarHash $AsarPath
@@ -2064,12 +2037,11 @@ function Install-Patch {
 
         Write-Step "Phase 2 & 3: Executable Patching & Cert Synchronization"
         if ((Test-Path $ExePath) -and (Test-Path $CoworkSvcPath)) {
-            
-            # 1. READ FROM BAK FILES FOR IDEMPOTENCY
+
+            # Read from .bak when present so the patch is idempotent on re-runs.
             $SourceSvc = if (Test-Path "$CoworkSvcPath.bak") { "$CoworkSvcPath.bak" } else { $CoworkSvcPath }
             $SourceExe = if (Test-Path "$ExePath.bak") { "$ExePath.bak" } else { $ExePath }
 
-            # EXACT PYTHON LOGIC: PURE BYTE ARRAY SEARCH
             $SvcBytes = [System.IO.File]::ReadAllBytes($SourceSvc)
             $AnchorBytes = [System.Text.Encoding]::ASCII.GetBytes("Anthropic, PBC")
             
@@ -2102,7 +2074,7 @@ function Install-Patch {
 
             Write-Log "Target cowork-svc hole found at $([Convert]::ToString($StartPos, 16)) (Size: $OldCertSize bytes)."
 
-            # 2. EXTRACT ORIGINAL SUBJECT FOR STEALTH
+            # Clone the original cert Subject so the replacement blends into the binary's existing metadata.
             $OriginalSig = Get-AuthenticodeSignature -FilePath $SourceExe
             $CertSubject = "CN=Claude-RTL-Patcher"
             if ($OriginalSig -and $OriginalSig.SignerCertificate) {
@@ -2110,7 +2082,6 @@ function Install-Patch {
                 Write-Log "Cloning original certificate subject: $CertSubject"
             }
 
-            # 3. DYNAMIC CERTIFICATE GENERATION LOOP
             $ValidCertFound = $false
             $Attempts = 1
             $MaxAttempts = 10
@@ -2142,7 +2113,7 @@ function Install-Patch {
                 throw "Failed to generate a suitably sized certificate after $MaxAttempts attempts."
             }
 
-            # 4. SWAP ALL HASHES IN CLAUDE.EXE (PURE BYTE SEARCH LIKE r.js)
+            # Byte-search hash swap mirrors the original r.js script byte-for-byte.
             Wait-FileUnlock $ExePath
             Write-Log "Reading claude.exe into memory..."
             $ExeBytes = [System.IO.File]::ReadAllBytes($SourceExe)
@@ -2182,7 +2153,6 @@ function Install-Patch {
             if ($SignResult.Status -eq 'Valid') { Write-Success "Successfully re-signed claude.exe" }
             else { throw "Re-signing claude.exe failed: $($SignResult.Status)" }
 
-            # 5. EXACT PADDING AND BINARY SWAP IN COWORK-SVC.EXE
             Wait-FileUnlock $CoworkSvcPath
             $Diff = $OldCertSize - $NewCertBytes.Length
             Write-Log "Swapping cowork-svc cert and padding with $Diff bytes of 0x00..."
@@ -2194,7 +2164,6 @@ function Install-Patch {
             [System.IO.File]::WriteAllBytes($CoworkSvcPath, $SvcBytes)
             Write-Success "Binary cert replacement completed in cowork-svc.exe"
 
-            # 6. SIGN COWORK-SVC.EXE
             Write-Log "Re-signing cowork-svc.exe with self-signed certificate (this can take several seconds)..."
             $SignResult2 = Set-AuthenticodeSignature -FilePath $CoworkSvcPath -Certificate $Cert -HashAlgorithm SHA256
             if ($SignResult2.Status -eq 'Valid') { Write-Success "Successfully re-signed cowork-svc.exe" }
@@ -2335,9 +2304,7 @@ function Install-Patch {
         }
 
     } Catch {
-        # ==========================================
-        # FALLBACK / ROLLBACK MECHANISM
-        # ==========================================
+        # Rollback path: surface the failure and restore the live files from .bak.
         $ErrorMessage = $_.Exception.Message
         Write-Host "`n[X] CRITICAL ERROR DETECTED DURING PATCHING!" -ForegroundColor Red
         Write-Host "    Reason: $ErrorMessage" -ForegroundColor Red
@@ -2542,7 +2509,6 @@ function Show-Menu {
     else { Show-Menu }
 }
 
-# Start the application
 if ($Auto) {
     Write-Host "`n=======================================================" -ForegroundColor Cyan
     Write-Host "  AUTO RE-PATCH MODE (triggered by Claude update)" -ForegroundColor Cyan
