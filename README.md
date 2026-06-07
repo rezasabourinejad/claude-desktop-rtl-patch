@@ -6,11 +6,38 @@ Smart RTL (Right-to-Left) support for **Claude Desktop on Windows**. Adds automa
 
 * **Auto-detects RTL text** in Claude's responses and input box
 
+* **Bundles the Vazir font** (Vazirmatn) for Persian/Arabic display — embedded offline as a `data:` URI (no CDN), scoped so English, Hebrew, and code blocks keep Claude's original fonts. Configurable or disableable — see [Display font](#display-font-persian--arabic).
+
 * **Keeps code blocks LTR** — no broken formatting
 
 * **Creates backups** of all modified files with full restore support
 
 * **Automated Updates** — Optional background service to automatically re-apply the patch when Claude updates
+
+## Display font (Persian / Arabic)
+
+The patch ships a display font so Arabic-script text (Persian, Arabic, …) renders consistently regardless of which fonts the user has installed. The default is **Vazirmatn** — the actively-maintained successor of the popular **Vazir** font — bundled as the Google *arabic* subset (variable weight 100–900, so bold and headings work too).
+
+* **Embedded, not fetched.** The font is inlined as a base64 `data:` URI inside the injected CSS. Claude's renderer CSP allows `font-src 'self' data:` but blocks remote/CDN font URLs, so a `data:` URI is the only way to ship a webfont into the app.
+
+* **Surgically scoped.** A CSS `unicode-range` restricts the font to Arabic-script codepoints **only**. English (Latin), **Hebrew** (Vazir doesn't cover it), and code blocks all keep Claude's original fonts — verified by canvas-metric tests.
+
+### Changing or disabling the font
+
+No code edits required — pass flags when running `patch.ps1`:
+
+```powershell
+# Use your own font (woff2 / woff / ttf / otf), embedded automatically:
+.\patch.ps1 -FontFile "C:\path\to\MyFont.woff2" -FontFamily "My Font"
+
+# Optionally narrow/extend the glyph scope (defaults to the Arabic-script range):
+.\patch.ps1 -FontFile "C:\path\to\MyFont.woff2" -FontUnicodeRange "U+0600-06FF,U+0750-077F"
+
+# Turn the bundled font off entirely (RTL layout still applies):
+.\patch.ps1 -NoFont
+```
+
+To change the **default** instead, edit the clearly-marked `RTL DISPLAY FONT` config block near the top of `patch.ps1` (`$script:RtlFontFamily`, `$script:RtlFontUnicodeRange`, `$script:RtlFontBase64`).
 
 ## Quick Install
 
