@@ -1,10 +1,14 @@
 # Claude Desktop RTL Patch
 
+> **Fork note:** This is a community fork of [shraga100/claude-desktop-rtl-patch](https://github.com/shraga100/claude-desktop-rtl-patch) that adds an embedded **Vazir** display font for Persian/Arabic. It is signed with this fork's **own** RSA key (fingerprint below), independent of upstream.
+
 Smart RTL (Right-to-Left) support for **Claude Desktop on Windows**. Adds automatic **Hebrew, Persian (فارسی), and Arabic** text direction detection without breaking English or code blocks — and bundles the **Vazir** font for Persian/Arabic display.
 
 ## What it does
 
 * **Auto-detects RTL text** in Claude's responses and input box
+
+* **Bundles the Vazir font** (Vazirmatn) for Persian/Arabic display — embedded offline as a `data:` URI (no CDN), scoped so English, Hebrew, and code blocks keep Claude's original fonts. Configurable or disableable — see [Display font](#display-font-persian--arabic).
 
 * **Keeps code blocks LTR** — no broken formatting
 
@@ -12,11 +16,36 @@ Smart RTL (Right-to-Left) support for **Claude Desktop on Windows**. Adds automa
 
 * **Automated Updates** — Optional background service to automatically re-apply the patch when Claude updates
 
+## Display font (Persian / Arabic)
+
+The patch ships a display font so Arabic-script text (Persian, Arabic, …) renders consistently regardless of which fonts the user has installed. The default is **Vazirmatn** — the actively-maintained successor of the popular **Vazir** font — bundled as the Google *arabic* subset (variable weight 100–900, so bold and headings work too).
+
+* **Embedded, not fetched.** The font is inlined as a base64 `data:` URI inside the injected CSS. Claude's renderer CSP allows `font-src 'self' data:` but blocks remote/CDN font URLs, so a `data:` URI is the only way to ship a webfont into the app.
+
+* **Surgically scoped.** A CSS `unicode-range` restricts the font to Arabic-script codepoints **only**. English (Latin), **Hebrew** (Vazir doesn't cover it), and code blocks all keep Claude's original fonts — verified by canvas-metric tests.
+
+### Changing or disabling the font
+
+No code edits required — pass flags when running `patch.ps1`:
+
+```powershell
+# Use your own font (woff2 / woff / ttf / otf), embedded automatically:
+.\patch.ps1 -FontFile "C:\path\to\MyFont.woff2" -FontFamily "My Font"
+
+# Optionally narrow/extend the glyph scope (defaults to the Arabic-script range):
+.\patch.ps1 -FontFile "C:\path\to\MyFont.woff2" -FontUnicodeRange "U+0600-06FF,U+0750-077F"
+
+# Turn the bundled font off entirely (RTL layout still applies):
+.\patch.ps1 -NoFont
+```
+
+To change the **default** instead, edit the clearly-marked `RTL DISPLAY FONT` config block near the top of `patch.ps1` (`$script:RtlFontFamily`, `$script:RtlFontUnicodeRange`, `$script:RtlFontBase64`).
+
 ## Quick Install
 
 Open **PowerShell** and run:
 
-`irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1 | iex`
+`irm https://raw.githubusercontent.com/rezasabourinejad/claude-desktop-rtl-patch/main/install.ps1 | iex`
 
 A UAC prompt will appear — click **Yes** to grant admin privileges.
 
@@ -124,13 +153,13 @@ This project is open source (MIT). Contributions to improve RTL accuracy are wel
 **Public-key fingerprint (SHA-256):**
 
 ```
-6e:f4:c2:a6:c2:42:34:a1:5f:e5:cd:e5:5d:a5:b0:3c:94:64:b4:56:7f:81:04:7c:83:9a:50:1c:7c:6f:07:c9
+94:e0:2b:e5:ec:f5:75:57:86:18:b5:01:d2:2e:03:7c:62:83:0a:26:91:a4:b1:32:09:0e:f6:2e:4e:48:57:cf
 ```
 
 If you're paranoid (and that's a healthy state when running `irm | iex` as Administrator), you can recompute the fingerprint of the public key embedded in `install.ps1` and check it matches the value above:
 
 ```powershell
-$content = Invoke-RestMethod "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1"
+$content = Invoke-RestMethod "https://raw.githubusercontent.com/rezasabourinejad/claude-desktop-rtl-patch/main/install.ps1"
 if ($content -match "ExpectedPubKey\s*=\s*'([A-Za-z0-9+/=]+)'") {
     $bytes = [Convert]::FromBase64String($matches[1])
     $hash  = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
@@ -143,7 +172,7 @@ A mismatch means the embedded key was swapped — do **not** proceed; report it 
 To audit a release manually without installing:
 
 ```powershell
-git clone https://github.com/shraga100/claude-desktop-rtl-patch
+git clone https://github.com/rezasabourinejad/claude-desktop-rtl-patch
 cd claude-desktop-rtl-patch
 powershell -ExecutionPolicy Bypass -File tools\verify-signature.ps1
 ```

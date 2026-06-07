@@ -1,4 +1,4 @@
-# Claude RTL Patch -- verified installer.
+﻿# Claude RTL Patch -- verified installer.
 #
 # Downloads patch.ps1 and patch.ps1.sig from GitHub, verifies the signature
 # against an RSA-4096 public key hardcoded below (private key lives offline on
@@ -8,12 +8,12 @@
 # users -- the attacker would also need the maintainer's offline private key.
 #
 # Public-key fingerprint (SHA-256 over the embedded JSON blob below):
-#   6e:f4:c2:a6:c2:42:34:a1:5f:e5:cd:e5:5d:a5:b0:3c:94:64:b4:56:7f:81:04:7c:83:9a:50:1c:7c:6f:07:c9
+#   94:e0:2b:e5:ec:f5:75:57:86:18:b5:01:d2:2e:03:7c:62:83:0a:26:91:a4:b1:32:09:0e:f6:2e:4e:48:57:cf
 # Cross-check this at the project README and any out-of-band channel (e.g.
 # release notes, social) before trusting a fresh install.
-$ExpectedPubKey = 'eyJNb2R1bHVzIjoibkhzT3FXUUxVdjV3amVYc2RDVmYwQzNkTzdJd2U1S2lKTWJJS0poZkx3TGZWcE0vYzVMamZNc0lmbDVtZjk2UkVvaEdKdVZneVM2dGVGcXJINnpQNUE0Q3dLQ2s2Mk42Sy9lOXBNbGZSTDZpa281QmExOFRvckdQcjRpRVB4eGQ5NGVxL3dhUzNVRFBiNlZKaHU0MUFrdFQ2Z0pSTEdEenhRa011Rk1NSFc1SmgvMW5Bd3liNmk4bFdJZmZKS2lNUTgzZWI3OHBPVEIvdFpqUWU5RWZZdXg5aTJNK0psV1NuN3lheVRUNCtHM2xMNlJPRFI0V2pkZi91aE5jQ1NMN0NZdjFjVmViVW51WEtMc0dwaWdBOFVxc2piWkdIcEdXOEtVUXFhWGdDVFQ4NmIyZXl4aXVJc0theXE4NVQ4VkNrTGhtRnhqeE5PSGdFVmZPMmVFck9OV252OXZPMVNtb1YrK1VZUUNPTDVnbkE4cHFmVG1nTkIyU0pFOVIrOGtlWldIcVY1OCthOFBUWFlCZ1RHMlJMY2ZZVGZnUW0vTXVQdkg3UnlmVjlJMFJVeTJaaDZKTEsxT2xIT1kwc2Y2NW0wL0kwMXQzRjVmbmdnUTM0allJSWtzTThDRCtHZ2VnUWtmL2JVWHk0T2ZKYWdFK05UcndQNmJVVU9mT3N2dlVYY0ZDU3o0Y01qUWRzeTNnOE0wOWNWQmYzTzR1YzIrMEJ3TGZ3dXJjeFk1cWJJaHdmRmZWbkdSckt1UlBYdEZrd01pUEo4c3c4cGo0MU9WcEdKQVoxV2dpZnUvR2JqU1ovTXdMTk1PaThXbzBVZUg4ZFE2UFk2aUJiY1dqbUx1WHhCbjQ2R3Qwa0R1dEtCNEJCT0MrTHg2ajQ0M3ZWc2NTeFBrNVBvL0NKRlU9IiwiRXhwb25lbnQiOiJBUUFCIn0='
+$ExpectedPubKey = 'eyJNb2R1bHVzIjoidFlNMWdTcGZKYVQrY2VvOUwyRTV6dHZ5aDlsTnp5cjVNNE5oNUdLOUJLeXMwNnZOMzZQTlVzWW40alNCUjA5QzRVVm5DTWwxbjY2MVI2Kys2bVpQZVppOVR4YSs4ZCt1QnpLRFJ1MDQzREEvY2ErT0JDTWg3eFNkVSs4bDAyWFU5V1VvQ0pvdHN5TkR1ZVY2NmtaUERhVzdJV1orNXlsZSs5S3RPZXlyTmlJQWNFSUttTlcrYWtiYkJaVUgxQVR0OCs3MDlZd3l0WThSQmxidi91dmdTSDVPWnZCMXdRd0lOTlVJNUtCOGZoM1UwdWlpVEowOUN6UGJGYSsxSTg5OWVNT2lwODdFTm1JaWwzL1ZqRi8rUWMxdHVQNVM3VXNrS0tsWnczUDBGdHVzVlRQMCt1Y1o3ZUxiZWtlSURKYUMzTExpS3hxaWg1MEFFTkk2K09sem5HNHpoYi9QdTRvL2RlYm9EdjNrb1d5N0dnenRDSmorVS92Sm1yVGphajlHMGF3WjVWVDJQRDhpYk9VcFllVjd5UitTSXNsQW1YbEVyUkMzMXI0bmJjWXFOdjFCSEIySkR6RXFJSWQ4eDA4TFh4bWRYdUJjTWZoUVBSVVAxa0RTOVh5U3MxbDBNT1FYVXZseGhWWGFWRlF6S2syK0p3aWpCS3Z3MEYyRXdWWkFLanBJNys3ZjhuTC9jaEZBZDJhTnVodmNoWDYxY3VJdktKaGk0VHFLdlBrLzY3TW1yZlhvcGpCdUtJdXFXZ0dSbmk0N01BTzVWNHVEYWt0VENabEtPVHNyVVBWOWJ5aHdQRGxWWW1CUkx3MzV2UFJFNmZGSk9yc29oV3BJL0ozY1Z1bXJ6N1VQSkl4UFZDTmw4TnQzUE5yMGdvZ2IrOGYzZXpTYVl0TG5LN0U9IiwiRXhwb25lbnQiOiJBUUFCIn0='
 
-$RepoBase = 'https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main'
+$RepoBase = 'https://raw.githubusercontent.com/rezasabourinejad/claude-desktop-rtl-patch/main'
 $TmpFile  = Join-Path $env:TEMP 'claude_rtl_patch.ps1'
 
 # PS 5.1 defaults to TLS 1.0; GitHub requires 1.2+.
@@ -80,7 +80,7 @@ if (-not $valid) {
     Write-Host "  * A maintainer pushed patch.ps1 without re-signing." -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Cross-check the public-key fingerprint at:" -ForegroundColor Cyan
-    Write-Host "  https://github.com/shraga100/claude-desktop-rtl-patch#verification" -ForegroundColor Cyan
+    Write-Host "  https://github.com/rezasabourinejad/claude-desktop-rtl-patch#verification" -ForegroundColor Cyan
     return
 }
 
